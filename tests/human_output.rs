@@ -40,3 +40,11 @@ fn builds_a_report_from_a_launchd_probe() {
     assert!(output.contains("Runs since load: 2"));
     assert!(output.contains("Last result: success"));
 }
+
+#[test]
+fn absent_legacy_evidence_does_not_infer_nix_darwin_configuration() {
+    let output = report_from_launchd(None, false).expect("absence is a valid report");
+
+    assert!(output.contains("Configuration: not detected (observed)"));
+    assert!(!output.contains("Configuration: nix-darwin nix.gc.automatic"));
+}

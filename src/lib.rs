@@ -27,6 +27,9 @@ pub struct MaintenanceStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError;
 
+// LLM contract: valid launchd text produces a loaded configuration; `running`
+// implies `loaded`. An absent job is not running, and Configuration then follows
+// the independent plist observation. Failed probes belong to the typed API.
 pub fn parse_launchd_status(input: &str) -> Result<MaintenanceStatus, ParseError> {
     let job = input
         .lines()
@@ -136,11 +139,12 @@ pub fn render_human(status: &MaintenanceStatus) -> String {
     };
 
     writeln!(output, "Garbage collection: {enabled}").expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "Configuration: nix-darwin nix.gc.automatic (inferred)"
-    )
-    .expect("writing to a String cannot fail");
+    let configuration = if status.configured {
+        "nix-darwin nix.gc.automatic (inferred)"
+    } else {
+        "not detected (observed)"
+    };
+    writeln!(output, "Configuration: {configuration}").expect("writing to a String cannot fail");
     writeln!(output, "Runtime job: {} ({runtime})", status.job)
         .expect("writing to a String cannot fail");
     if let Some(schedule) = &status.schedule {
