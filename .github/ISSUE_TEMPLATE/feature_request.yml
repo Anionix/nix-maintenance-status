@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a focused improvement to the diagnostic or its evidence model.
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep requests focused. The roadmap is directional and does not guarantee delivery.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Explain the user problem or missing evidence, not only the desired implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the expected CLI behavior or report output.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Evidence classification
+      description: Which kind of evidence would the proposal expose?
+      options:
+        - Observed directly from the system
+        - Inferred from observed evidence
+        - Unknown or not yet determined
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: The proposed behavior can remain read-only and telemetry-free.
+          required: true

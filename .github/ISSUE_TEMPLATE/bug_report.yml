@@ -1,0 +1,77 @@
+name: Bug report
+description: Report incorrect or unexpected diagnostic behavior on macOS with nix-darwin.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. This project is experimental and currently supports only macOS with nix-darwin.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what happened and why it appears incorrect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version and architecture
+      placeholder: macOS 26.x, aarch64-darwin
+    validations:
+      required: true
+
+  - type: input
+    id: nix-version
+    attributes:
+      label: Nix version
+      placeholder: nix (Nix) 2.x
+    validations:
+      required: true
+
+  - type: input
+    id: nix-darwin-revision
+    attributes:
+      label: nix-darwin revision
+      description: Provide the locked revision or channel when known.
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Diagnostic output
+      description: Remove usernames, private paths, and unrelated sensitive information.
+      render: text
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for the same behavior.
+          required: true
+        - label: I removed private or sensitive information from the report.
+          required: true
+        - label: This is not a vulnerability report.
+          required: true

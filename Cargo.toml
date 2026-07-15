@@ -1,0 +1,21 @@
+[package]
+name = "nix-maintenance-status"
+version = "0.1.0"
+edition = "2024"
+authors = ["Anionix"]
+description = "Explain the effective status of automated Nix maintenance"
+license = "MIT"
+repository = "https://github.com/Anionix/nix-maintenance-status"
+homepage = "https://github.com/Anionix/nix-maintenance-status"
+readme = "README.md"
+keywords = ["nix", "nix-darwin", "macos", "observability", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[lib]
+name = "nix_maintenance_status"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nix-maintenance-status"
+path = "src/main.rs"
