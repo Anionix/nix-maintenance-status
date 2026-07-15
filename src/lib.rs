@@ -1,5 +1,9 @@
 use std::fmt::Write;
 
+mod diagnostic;
+
+pub use diagnostic::*;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LastResult {
     NeverRun,
