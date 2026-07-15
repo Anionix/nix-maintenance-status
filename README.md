@@ -48,13 +48,9 @@ Example output:
 ```text
 Nix maintenance status
 
-Garbage collection: enabled
-Configuration: nix-darwin nix.gc.automatic (inferred)
-Runtime job: org.nixos.nix-gc (loaded, idle)
-Schedule: weekday 7 at 03:15
-Command: /nix/store/...-nix/bin/nix-collect-garbage
-Runs since load: 0
-Last result: never run since the job was loaded
+Configuration: consistent with nix-darwin automatic GC [inferred]
+Runtime: loaded [observed]
+Consistency: consistent [inferred]
 ```
 
 ## Safety and privacy
@@ -86,20 +82,17 @@ The report distinguishes what the system proves from what the tool infers:
 
 | Classification | Meaning | Example |
 | --- | --- | --- |
-| Observed | Read directly from the runtime job | loaded state, command, run count |
-| Inferred | Conventional source suggested by observed evidence | `nix.gc.automatic` from the standard job label |
+| Observed | Read directly from the inspected artifacts | plist or loaded-job presence |
+| Inferred | Conclusion derived from observed evidence | standard plist is consistent with automatic GC |
 | Unknown | Not exposed by the inspected interface | exact `.nix` source file |
 
 launchd exposes the generated job but does not identify the original Nix source
-file or module assignment. For that reason, configuration provenance is always
-marked as `inferred`.
+file or module assignment. A detected standard plist is therefore marked
+`inferred`; its absence is observed and reported as `not detected`.
 
 ## Current limitations
 
 - Only macOS with nix-darwin is supported.
-- Schedules use launchd's numeric calendar representation.
-- Run counts and exit results describe the currently loaded job, not durable
-  execution history.
 - Parsing relies on the human-readable output of `launchctl print`.
 - Exact option provenance and the next wall-clock execution time are unavailable.
 

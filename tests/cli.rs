@@ -22,9 +22,19 @@ fn default_command_reports_the_effective_macos_status() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 status output");
-    assert!(stdout.contains("Nix maintenance status"));
-    assert!(stdout.contains("Configuration: nix-darwin nix.gc.automatic (inferred)"));
-    assert!(stdout.contains("Runtime job: org.nixos.nix-gc"));
+    let lines = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(lines[0], "Nix maintenance status");
+    assert!(lines[1].starts_with("Configuration: "));
+    assert!(lines[2].starts_with("Runtime: "));
+    assert!(lines[3].starts_with("Consistency: "));
+    assert!(lines[1..].iter().all(|line| {
+        line.ends_with("[observed]") || line.ends_with("[inferred]") || line.ends_with("[unknown]")
+    }));
+    assert!(!stdout.contains("Garbage collection:"));
 }
 
 #[cfg(not(target_os = "macos"))]

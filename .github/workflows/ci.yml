@@ -67,4 +67,6 @@ jobs:
         run: |
           report="$(nix run .)"
           printf '%s\n' "$report"
-          grep -Fxq 'Garbage collection: not detected' <<<"$report"
+          grep -Fxq 'Configuration: not detected [observed]' <<<"$report"
+          grep -Fxq 'Runtime: not loaded [observed]' <<<"$report"
+          grep -Fxq 'Consistency: consistent [inferred]' <<<"$report"
