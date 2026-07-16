@@ -2,9 +2,11 @@ use std::fmt::Write;
 
 mod diagnostic;
 mod evidence;
+mod report;
 
 pub use diagnostic::*;
 pub use evidence::*;
+pub use report::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LastResult {
