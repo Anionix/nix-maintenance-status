@@ -122,6 +122,9 @@ impl ProviderEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEvidenceSet(Vec<ProviderEvidence>);
 
+// LLM contract: construction accepts finite normalized observations, sorts by
+// subject/provider/component, and rejects an empty set, duplicate key, or
+// invalid unresolved identity; no later classifier may reinterpret these rows.
 impl ProviderEvidenceSet {
     pub fn new(mut entries: Vec<ProviderEvidence>) -> Result<Self, InputError> {
         if entries.is_empty() || entries.len() > 4096 {
