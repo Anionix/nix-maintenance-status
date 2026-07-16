@@ -238,7 +238,10 @@ pub(crate) fn validate_input(
 ) -> Result<(), InputError> {
     let platform_ok = |provider| match platform {
         TargetPlatform::MacOs => provider == Provider::NixDarwinLaunchd,
-        TargetPlatform::Linux => provider != Provider::NixDarwinLaunchd,
+        TargetPlatform::Linux => matches!(
+            provider,
+            Provider::NixOsSystemd | Provider::Cronie | Provider::Anacron | Provider::Fcron
+        ),
     };
     if entries
         .entries()
@@ -269,34 +272,39 @@ pub(crate) fn validate_input(
             && entry.presence
                 == Presence::Unavailable(UnavailableReason::ExternalIdentityMayBeRelevant)
     };
-    if entries
-        .entries()
-        .iter()
-        .any(|entry| entry.subject.is_unresolved() && !unresolved_allowed(entry))
-        || entries.entries().iter().any(|entry| {
-            matches!(
+    if entries.entries().iter().any(|entry| {
+        entry.subject.is_unresolved()
+            && !unresolved_allowed(entry)
+            && !matches!(
                 entry.presence,
                 Presence::Unavailable(UnavailableReason::ExternalIdentityMayBeRelevant)
-            ) && !unresolved_allowed(entry)
-        })
-    {
+            )
+    }) {
         return Err(InputError::InvalidSubject);
     }
-    match scope {
-        ScanScope::System if subjects.iter().any(|subject| *subject != Subject::System) => {
-            Err(InputError::InvalidScope)
-        }
-        ScanScope::CurrentUser
-            if users.len() != 1
-                || subjects
+    if entries.entries().iter().any(|entry| {
+        matches!(
+            entry.presence,
+            Presence::Unavailable(UnavailableReason::ExternalIdentityMayBeRelevant)
+        ) && !unresolved_allowed(entry)
+    }) {
+        return Err(InputError::InvalidScope);
+    }
+    let valid_scope = match scope {
+        ScanScope::System => subjects.iter().all(|subject| *subject == Subject::System),
+        ScanScope::CurrentUser => {
+            users.len() == 1
+                && subjects
                     .iter()
-                    .any(|subject| !matches!(subject, Subject::Uid(_))) =>
-        {
-            Err(InputError::InvalidScope)
+                    .all(|subject| matches!(subject, Subject::Uid(_)))
         }
-        ScanScope::Default if !has_system || users.len() != 1 => Err(InputError::InvalidScope),
-        ScanScope::AllUsers if !has_system || users.is_empty() => Err(InputError::InvalidScope),
-        _ => Ok(()),
+        ScanScope::Default => has_system && users.len() == 1,
+        ScanScope::AllUsers => has_system && !users.is_empty(),
+    };
+    if valid_scope {
+        Ok(())
+    } else {
+        Err(InputError::InvalidScope)
     }
 }
 
