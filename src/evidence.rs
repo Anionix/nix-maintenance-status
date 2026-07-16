@@ -1,10 +1,3 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TargetPlatform {
-    MacOs,
-    Linux,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Provider {
@@ -80,21 +73,10 @@ pub enum Presence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ScanScope {
-    System,
-    CurrentUser,
-    Default,
-    AllUsers,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum InputError {
-    InvalidPlatformProvider,
     DuplicateEvidenceKey,
     InvalidSubject,
     CardinalityExceeded,
-    InvalidScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,76 +139,5 @@ impl ProviderEvidenceSet {
 
     pub fn entries(&self) -> &[ProviderEvidence] {
         &self.0
-    }
-}
-
-/// Validates adapter output before a report classifier consumes it. This seam
-/// stores normalized states only; it never stores paths, commands, raw bytes,
-/// account metadata, OS errors, telemetry, or authority assertions.
-pub fn validate_input(
-    platform: TargetPlatform,
-    scope: ScanScope,
-    entries: &ProviderEvidenceSet,
-) -> Result<(), InputError> {
-    let platform_ok = |provider| match platform {
-        TargetPlatform::MacOs => provider == Provider::NixDarwinLaunchd,
-        TargetPlatform::Linux => provider != Provider::NixDarwinLaunchd,
-    };
-    if entries
-        .entries()
-        .iter()
-        .any(|entry| !platform_ok(entry.provider))
-    {
-        return Err(InputError::InvalidPlatformProvider);
-    }
-    let subjects: Vec<_> = entries
-        .entries()
-        .iter()
-        .map(|entry| entry.subject)
-        .collect();
-    let mut users: Vec<_> = subjects
-        .iter()
-        .filter_map(|subject| match subject {
-            Subject::Uid(uid) => Some(*uid),
-            Subject::System | Subject::Unresolved(_) => None,
-        })
-        .collect();
-    users.sort_unstable();
-    users.dedup();
-    let has_system = subjects.contains(&Subject::System);
-    if entries.entries().iter().any(|entry| {
-        matches!(
-            entry.presence,
-            Presence::Unavailable(UnavailableReason::ExternalIdentityMayBeRelevant)
-        ) && !(scope == ScanScope::AllUsers
-            && entry.component == ObservationComponent::Discovery
-            && matches!(entry.subject, Subject::Unresolved(_)))
-    }) {
-        return Err(InputError::InvalidScope);
-    }
-    match scope {
-        ScanScope::System if subjects.iter().any(|s| *s != Subject::System) => {
-            Err(InputError::InvalidScope)
-        }
-        ScanScope::CurrentUser
-            if users.len() != 1 || subjects.iter().any(|s| !matches!(s, Subject::Uid(_))) =>
-        {
-            Err(InputError::InvalidScope)
-        }
-        ScanScope::Default
-            if !has_system
-                || users.len() != 1
-                || subjects.iter().any(|s| matches!(s, Subject::Unresolved(_))) =>
-        {
-            Err(InputError::InvalidScope)
-        }
-        ScanScope::AllUsers
-            if !has_system
-                || users.is_empty()
-                || subjects.iter().any(|s| matches!(s, Subject::Unresolved(0))) =>
-        {
-            Err(InputError::InvalidSubject)
-        }
-        _ => Ok(()),
     }
 }
