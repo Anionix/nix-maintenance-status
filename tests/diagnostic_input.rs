@@ -78,6 +78,13 @@ fn legacy_macos_constructor_remains_compatible() {
     ));
     assert_eq!(input.platform(), TargetPlatform::MacOs);
     assert!(input.evidence().is_none());
+    assert_eq!(
+        input,
+        DiagnosticInput::macos(MacOsEvidence::new(
+            Probe::Observed(GcPlist::new()),
+            Probe::<LaunchdJob>::Absent,
+        ))
+    );
     assert!(matches!(
         diagnose(input).configuration().conclusion(),
         Conclusion::Known(_)

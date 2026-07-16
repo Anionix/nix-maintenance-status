@@ -77,8 +77,8 @@ impl DiagnosticInput {
         Self {
             platform: TargetPlatform::MacOs,
             scope: ScanScope::System,
-            window: ScanWindow::now(std::time::Duration::from_secs(1))
-                .expect("one second is a valid scan window"),
+            window: ScanWindow::new(std::time::UNIX_EPOCH, std::time::Duration::from_secs(1))
+                .expect("the fixed legacy window is valid"),
             evidence: None,
             legacy: Some(evidence),
         }
@@ -199,6 +199,8 @@ impl GcReport {
 // LLM contract: plist and launchd Probes independently become Known for Observed/Absent
 // or Unknown for Unavailable. Consistency is Known only when both core Claims are Known;
 // equal presence is Consistent. Runtime never changes Configuration; Unknown is not Absent.
+// A generic validated input intentionally takes the unknown_report placeholder until the
+// report-classifier slice; it never reuses the legacy plist inference.
 pub fn diagnose(input: DiagnosticInput) -> GcReport {
     let Some(evidence) = input.legacy else {
         return unknown_report();
