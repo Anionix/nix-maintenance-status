@@ -1,3 +1,7 @@
+use crate::evidence::{
+    InputError, ProviderEvidenceSet, ScanScope, ScanWindow, TargetPlatform, validate_input,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProbeFailure {
@@ -42,11 +46,54 @@ impl MacOsEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiagnosticInput(MacOsEvidence);
+pub struct DiagnosticInput {
+    platform: TargetPlatform,
+    scope: ScanScope,
+    window: ScanWindow,
+    evidence: Option<ProviderEvidenceSet>,
+    legacy: Option<MacOsEvidence>,
+}
 
 impl DiagnosticInput {
+    // LLM contract: `new` is the only generic trigger and accepts only rows
+    // already validated by the scope seam; it preserves private normalized
+    // Evidence and rejects every validator error without I/O or mutation.
+    pub fn new(
+        platform: TargetPlatform,
+        scope: ScanScope,
+        window: ScanWindow,
+        evidence: ProviderEvidenceSet,
+    ) -> Result<Self, InputError> {
+        validate_input(platform, scope, &evidence)?;
+        Ok(Self {
+            platform,
+            scope,
+            window,
+            evidence: Some(evidence),
+            legacy: None,
+        })
+    }
     pub fn macos(evidence: MacOsEvidence) -> Self {
-        Self(evidence)
+        Self {
+            platform: TargetPlatform::MacOs,
+            scope: ScanScope::System,
+            window: ScanWindow::now(std::time::Duration::from_secs(1))
+                .expect("one second is a valid scan window"),
+            evidence: None,
+            legacy: Some(evidence),
+        }
+    }
+    pub const fn platform(&self) -> TargetPlatform {
+        self.platform
+    }
+    pub const fn scope(&self) -> ScanScope {
+        self.scope
+    }
+    pub const fn window(&self) -> ScanWindow {
+        self.window
+    }
+    pub fn evidence(&self) -> Option<&ProviderEvidenceSet> {
+        self.evidence.as_ref()
     }
 }
 
@@ -153,7 +200,9 @@ impl GcReport {
 // or Unknown for Unavailable. Consistency is Known only when both core Claims are Known;
 // equal presence is Consistent. Runtime never changes Configuration; Unknown is not Absent.
 pub fn diagnose(input: DiagnosticInput) -> GcReport {
-    let evidence = input.0;
+    let Some(evidence) = input.legacy else {
+        return unknown_report();
+    };
     let (configuration, configured) = claim_from_probe(
         evidence.0,
         ConfigurationState::ConsistentWithNixDarwinAutomaticGc,
@@ -182,6 +231,14 @@ pub fn diagnose(input: DiagnosticInput) -> GcReport {
         configuration,
         runtime,
         consistency,
+    }
+}
+
+fn unknown_report() -> GcReport {
+    GcReport {
+        configuration: Claim::unknown(UnknownReason::DependentClaimUnknown),
+        runtime: Claim::unknown(UnknownReason::DependentClaimUnknown),
+        consistency: Claim::unknown(UnknownReason::DependentClaimUnknown),
     }
 }
 
