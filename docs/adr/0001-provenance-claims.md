@@ -1,7 +1,14 @@
 # ADR 0001: Model diagnostics as provenance-bearing claims
 
-- Status: Accepted
+- Status: Historical — accepted 0.1 rationale; superseded for cross-platform
+  0.2 by [ADR 0002](0002-cross-platform-gc-inventory.md)
 - Date: 2026-07-15
+
+> This ADR is retained unchanged as the accepted macOS 0.1 architecture
+> rationale. It is not the normative source for the cross-platform 0.2 API,
+> provider inventory, Authority Catalog, Coverage algebra, or CLI contract.
+> Use [Spec #27](https://github.com/Anionix/nix-maintenance-status/issues/27)
+> and ADR 0002 for 0.2 work; do not create a second macOS implementation path.
 
 ## Context
 
