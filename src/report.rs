@@ -22,8 +22,8 @@ impl ReportEvidence {
     pub fn id(&self) -> EvidenceId {
         self.id.clone()
     }
-    pub const fn value(&self) -> ProviderEvidence {
-        self.value
+    pub const fn value(&self) -> &ProviderEvidence {
+        &self.value
     }
 }
 
@@ -65,6 +65,8 @@ pub fn build_ledger(input: &DiagnosticInput) -> Result<EvidenceLedger, LedgerErr
             value.provider().catalog_order(),
             value.subject(),
             value.component(),
+            value.occurrence().cloned(),
+            value.presence(),
         )
     });
     let entries = values
