@@ -363,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_window_boundaries_are_explicit() {
-        let system = ProviderEvidenceSet::new(vec![
+    fn provider_and_scope_matrix_is_explicit() {
+        let rows = ProviderEvidenceSet::new(vec![
             ProviderEvidence::new(
                 Provider::NixOsSystemd,
                 Subject::System,
@@ -372,10 +372,23 @@ mod tests {
                 Presence::Present,
             )
             .unwrap(),
+            ProviderEvidence::new(
+                Provider::NixOsSystemd,
+                Subject::Uid(1000),
+                ObservationComponent::Discovery,
+                Presence::Present,
+            )
+            .unwrap(),
         ])
         .unwrap();
+        assert!(validate_input(TargetPlatform::Linux, ScanScope::Default, &rows).is_ok());
+        assert!(validate_input(TargetPlatform::Linux, ScanScope::AllUsers, &rows).is_ok());
         assert_eq!(
-            validate_input(TargetPlatform::Linux, ScanScope::CurrentUser, &system),
+            validate_input(TargetPlatform::MacOs, ScanScope::Default, &rows),
+            Err(InputError::InvalidPlatformProvider)
+        );
+        assert_eq!(
+            validate_input(TargetPlatform::Linux, ScanScope::System, &rows),
             Err(InputError::InvalidScope)
         );
         assert!(ScanWindow::new(UNIX_EPOCH, Duration::ZERO).is_err());
