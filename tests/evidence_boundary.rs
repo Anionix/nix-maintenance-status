@@ -15,6 +15,10 @@ fn evidence(subject: Subject, component: ObservationComponent) -> ProviderEviden
 
 #[test]
 fn evidence_set_is_deterministic_and_rejects_duplicate_keys() {
+    assert_eq!(
+        ProviderEvidenceSet::new(Vec::new()),
+        Err(InputError::EmptyEvidence)
+    );
     let values = ProviderEvidenceSet::new(vec![
         evidence(Subject::System, ObservationComponent::Runtime),
         evidence(Subject::System, ObservationComponent::Discovery),

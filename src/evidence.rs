@@ -8,6 +8,18 @@ pub enum Provider {
     Fcron,
 }
 
+impl Provider {
+    pub const fn catalog_order(self) -> u8 {
+        match self {
+            Self::NixDarwinLaunchd => 0,
+            Self::NixOsSystemd => 1,
+            Self::Cronie => 2,
+            Self::Anacron => 3,
+            Self::Fcron => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Subject {
     System,
@@ -74,6 +86,7 @@ pub enum Presence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InputError {
+    EmptyEvidence,
     DuplicateEvidenceKey,
     InvalidSubject,
     CardinalityExceeded,
@@ -122,15 +135,21 @@ impl ProviderEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEvidenceSet(Vec<ProviderEvidence>);
 
-// LLM contract: construction accepts finite normalized observations, sorts by
-// subject/provider/component, and rejects an empty set, duplicate key, or
+// LLM contract: construction accepts normalized observations, sorts by the
+// catalog provider order, and rejects an empty set, duplicate key, or
 // invalid unresolved identity; no later classifier may reinterpret these rows.
 impl ProviderEvidenceSet {
     pub fn new(mut entries: Vec<ProviderEvidence>) -> Result<Self, InputError> {
-        if entries.is_empty() || entries.len() > 4096 {
-            return Err(InputError::CardinalityExceeded);
+        if entries.is_empty() {
+            return Err(InputError::EmptyEvidence);
         }
-        entries.sort_by_key(|entry| (entry.subject, entry.provider, entry.component));
+        entries.sort_by_key(|entry| {
+            (
+                entry.subject,
+                entry.provider.catalog_order(),
+                entry.component,
+            )
+        });
         if entries.windows(2).any(|pair| {
             (pair[0].subject, pair[0].provider, pair[0].component)
                 == (pair[1].subject, pair[1].provider, pair[1].component)
