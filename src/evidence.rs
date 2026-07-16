@@ -24,7 +24,6 @@ impl Provider {
 pub enum Subject {
     System,
     Uid(u32),
-    Unresolved(u32),
 }
 
 impl Subject {
@@ -34,15 +33,10 @@ impl Subject {
     pub const fn uid(uid: u32) -> Self {
         Self::Uid(uid)
     }
-    pub const fn unresolved(id: u32) -> Self {
-        Self::Unresolved(id)
-    }
-
     pub fn render(self) -> String {
         match self {
             Self::System => "system".into(),
             Self::Uid(uid) => format!("uid:{uid}"),
-            Self::Unresolved(id) => format!("subject:unresolved:{id}"),
         }
     }
 }
@@ -88,8 +82,6 @@ pub enum Presence {
 pub enum InputError {
     EmptyEvidence,
     DuplicateEvidenceKey,
-    InvalidSubject,
-    CardinalityExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,9 +99,6 @@ impl ProviderEvidence {
         component: ObservationComponent,
         presence: Presence,
     ) -> Result<Self, InputError> {
-        if subject == Subject::Unresolved(0) {
-            return Err(InputError::InvalidSubject);
-        }
         Ok(Self {
             provider,
             subject,
