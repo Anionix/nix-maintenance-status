@@ -1,6 +1,7 @@
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Provider {
     NixDarwinLaunchd,
@@ -79,7 +80,7 @@ pub enum ObservationComponent {
     LastResult,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum UnavailableReason {
     PermissionDenied,
@@ -94,7 +95,7 @@ pub enum UnavailableReason {
     ExternalIdentityMayBeRelevant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Presence {
     Absent,
     PresentEmpty,
@@ -111,6 +112,9 @@ pub enum InputError {
     InvalidScope,
     InvalidScanWindow,
     InvalidSubject,
+    InvalidNormalizedValue,
+    InvalidDefinitionOccurrence,
+    InconsistentInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,12 +160,180 @@ impl ScanWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Adapter-normalized identifiers reject raw control characters and never
+/// expose their text through Debug or a getter.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct NormalizedIdentifier(String);
+
+impl NormalizedIdentifier {
+    fn new(value: &str) -> Result<Self, InputError> {
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl fmt::Debug for NormalizedIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque>")
+    }
+}
+
+macro_rules! normalized_identifier {
+    ($name:ident, $visibility:vis) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(NormalizedIdentifier);
+
+        impl $name {
+            $visibility fn new(value: &str) -> Result<Self, InputError> {
+                Ok(Self(NormalizedIdentifier::new(value)?))
+            }
+        }
+    };
+}
+
+normalized_identifier!(LaunchdLabel, pub);
+normalized_identifier!(SystemdUnitId, pub);
+normalized_identifier!(AnacronStateNamespace, pub);
+normalized_identifier!(AnacronJobId, pub);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceRootId(u32);
+
+impl SourceRootId {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for SourceRootId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceRootId(<opaque>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum LaunchdDomain {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SystemdManagerIdentity {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SourceRoot {
+    LaunchdPlist(SourceRootId),
+    SystemdUnit(SourceRootId),
+    AnacronTable(SourceRootId),
+    CronieTable(SourceRootId),
+    FcronTable(SourceRootId),
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceOccurrenceKey {
+    root: SourceRoot,
+    ordinal: u32,
+}
+
+impl SourceOccurrenceKey {
+    pub const fn new(root: SourceRoot, ordinal: u32) -> Self {
+        Self { root, ordinal }
+    }
+    pub const fn root(&self) -> &SourceRoot {
+        &self.root
+    }
+}
+
+impl fmt::Debug for SourceOccurrenceKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceOccurrenceKey(<opaque>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CaptureSequence(u32);
+
+impl CaptureSequence {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for CaptureSequence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CaptureSequence(<opaque>)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ProviderLogicalKey {
+    Launchd {
+        domain: LaunchdDomain,
+        subject: Subject,
+        label: LaunchdLabel,
+    },
+    Systemd {
+        manager: SystemdManagerIdentity,
+        subject: Subject,
+        canonical_timer_id: SystemdUnitId,
+    },
+    Anacron {
+        state_namespace: AnacronStateNamespace,
+        subject: Subject,
+        job_id: AnacronJobId,
+    },
+    Anonymous,
+}
+
+/// Identity envelope only. Provider-native schedule, command, and execution
+/// shape is added by the provider-specific seams before inventory projection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DefinitionOccurrence {
+    logical_key: ProviderLogicalKey,
+    source: SourceOccurrenceKey,
+    capture: CaptureSequence,
+}
+
+impl DefinitionOccurrence {
+    pub fn new(
+        logical_key: ProviderLogicalKey,
+        source: SourceOccurrenceKey,
+        capture: CaptureSequence,
+    ) -> Self {
+        Self {
+            logical_key,
+            source,
+            capture,
+        }
+    }
+
+    pub const fn logical_key(&self) -> &ProviderLogicalKey {
+        &self.logical_key
+    }
+    pub const fn source(&self) -> &SourceOccurrenceKey {
+        &self.source
+    }
+    pub const fn capture(&self) -> &CaptureSequence {
+        &self.capture
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderEvidence {
     provider: Provider,
     subject: Subject,
     component: ObservationComponent,
     presence: Presence,
+    occurrence: Option<DefinitionOccurrence>,
 }
 
 impl ProviderEvidence {
@@ -176,20 +348,114 @@ impl ProviderEvidence {
             subject,
             component,
             presence,
+            occurrence: None,
         })
     }
 
-    pub const fn provider(self) -> Provider {
+    // LLM contract: normalized construction attaches one validated occurrence
+    // to any Presence state; provider/source/subject mismatches reject, while
+    // component-only rows remain transitional and never become candidates.
+    // Unavailable is monotone: missing identity stays Unavailable and no input
+    // or sort transition turns it into Absent, Present, or an inferred claim.
+    // An unresolved Subject may retain a report-local occurrence, but #44 must
+    // not promote it to a cross-report key or candidate AutomationId.
+    pub fn with_occurrence(
+        provider: Provider,
+        subject: Subject,
+        component: ObservationComponent,
+        presence: Presence,
+        occurrence: DefinitionOccurrence,
+    ) -> Result<Self, InputError> {
+        let identity_matches = matches!(
+            (
+                provider,
+                occurrence.logical_key(),
+                occurrence.source().root(),
+            ),
+            (
+                Provider::NixDarwinLaunchd,
+                ProviderLogicalKey::Launchd { .. },
+                SourceRoot::LaunchdPlist(_),
+            ) | (
+                Provider::NixOsSystemd,
+                ProviderLogicalKey::Systemd { .. },
+                SourceRoot::SystemdUnit(_),
+            ) | (
+                Provider::Anacron,
+                ProviderLogicalKey::Anacron { .. },
+                SourceRoot::AnacronTable(_),
+            ) | (
+                Provider::Cronie,
+                ProviderLogicalKey::Anonymous,
+                SourceRoot::CronieTable(_)
+            ) | (
+                Provider::Fcron,
+                ProviderLogicalKey::Anonymous,
+                SourceRoot::FcronTable(_)
+            )
+        );
+        if !identity_matches || !key_subject_matches_domain(occurrence.logical_key(), subject) {
+            return Err(InputError::InvalidDefinitionOccurrence);
+        }
+        Ok(Self {
+            provider,
+            subject,
+            component,
+            presence,
+            occurrence: Some(occurrence),
+        })
+    }
+
+    pub const fn provider(&self) -> Provider {
         self.provider
     }
-    pub const fn subject(self) -> Subject {
+    pub const fn subject(&self) -> Subject {
         self.subject
     }
-    pub const fn component(self) -> ObservationComponent {
+    pub const fn component(&self) -> ObservationComponent {
         self.component
     }
-    pub const fn presence(self) -> Presence {
+    pub const fn presence(&self) -> Presence {
         self.presence
+    }
+    pub const fn occurrence(&self) -> Option<&DefinitionOccurrence> {
+        self.occurrence.as_ref()
+    }
+}
+
+fn key_subject_matches_domain(key: &ProviderLogicalKey, subject: Subject) -> bool {
+    match key {
+        ProviderLogicalKey::Launchd {
+            domain,
+            subject: key_subject,
+            ..
+        } => {
+            *key_subject == subject
+                && match domain {
+                    LaunchdDomain::System => subject == Subject::System,
+                    LaunchdDomain::User => {
+                        matches!(subject, Subject::Uid(_) | Subject::Unresolved(_))
+                    }
+                }
+        }
+        ProviderLogicalKey::Systemd {
+            manager,
+            subject: key_subject,
+            ..
+        } => {
+            *key_subject == subject
+                && match manager {
+                    SystemdManagerIdentity::System => subject == Subject::System,
+                    SystemdManagerIdentity::User => {
+                        matches!(subject, Subject::Uid(_) | Subject::Unresolved(_))
+                    }
+                }
+        }
+        ProviderLogicalKey::Anacron {
+            subject: key_subject,
+            ..
+        } => *key_subject == subject,
+        ProviderLogicalKey::Anonymous => true,
     }
 }
 
@@ -197,8 +463,9 @@ impl ProviderEvidence {
 pub struct ProviderEvidenceSet(Vec<ProviderEvidence>);
 
 // LLM contract: construction accepts normalized observations, sorts by the
-// catalog provider order, and rejects an empty set or duplicate key; later
-// classifiers must preserve this order and never reinterpret normalized rows.
+// catalog provider order, preserves distinct typed occurrences and divergent
+// values for later conflict handling, and rejects an empty set or a repeated/
+// mixed component key; later classifiers never infer.
 impl ProviderEvidenceSet {
     pub fn new(mut entries: Vec<ProviderEvidence>) -> Result<Self, InputError> {
         if entries.is_empty() {
@@ -206,16 +473,43 @@ impl ProviderEvidenceSet {
         }
         entries.sort_by_key(|entry| {
             (
-                entry.subject,
                 entry.provider.catalog_order(),
+                entry.subject,
                 entry.component,
+                entry.occurrence.clone(),
+                entry.presence,
             )
         });
         if entries.windows(2).any(|pair| {
-            (pair[0].subject, pair[0].provider, pair[0].component)
-                == (pair[1].subject, pair[1].provider, pair[1].component)
+            pair[0].provider == pair[1].provider
+                && pair[0].subject == pair[1].subject
+                && pair[0].component == pair[1].component
+                && match (pair[0].occurrence.as_ref(), pair[1].occurrence.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        left == right && pair[0].presence == pair[1].presence
+                    }
+                    _ => true,
+                }
         }) {
             return Err(InputError::DuplicateEvidenceKey);
+        }
+        // LLM contract: one catalogued source slot plus capture can assert one
+        // logical key; a second key is malformed input, not multiplicity.
+        if entries.iter().enumerate().any(|(index, left)| {
+            entries.iter().skip(index + 1).any(|right| {
+                left.provider == right.provider
+                    && left.subject == right.subject
+                    && match (left.occurrence.as_ref(), right.occurrence.as_ref()) {
+                        (Some(left), Some(right)) => {
+                            left.source() == right.source()
+                                && left.capture() == right.capture()
+                                && left.logical_key() != right.logical_key()
+                        }
+                        _ => false,
+                    }
+            })
+        }) {
+            return Err(InputError::InconsistentInput);
         }
         Ok(Self(entries))
     }
@@ -401,5 +695,222 @@ mod tests {
         );
         assert!(ScanWindow::new(UNIX_EPOCH, Duration::ZERO).is_err());
         assert!(ScanWindow::new(UNIX_EPOCH, Duration::from_secs(31)).is_err());
+    }
+
+    fn launchd_occurrence(label: &str, ordinal: u32, capture: u32) -> DefinitionOccurrence {
+        DefinitionOccurrence::new(
+            ProviderLogicalKey::Launchd {
+                domain: LaunchdDomain::System,
+                subject: Subject::System,
+                label: LaunchdLabel::new(label).unwrap(),
+            },
+            SourceOccurrenceKey::new(SourceRoot::LaunchdPlist(SourceRootId::new(1)), ordinal),
+            CaptureSequence::new(capture),
+        )
+    }
+
+    #[test]
+    fn definition_occurrences_preserve_multiplicity_without_raw_identity() {
+        let first = ProviderEvidence::with_occurrence(
+            Provider::NixDarwinLaunchd,
+            Subject::System,
+            ObservationComponent::Runtime,
+            Presence::Present,
+            launchd_occurrence("org.nix.gc", 1, 0),
+        )
+        .unwrap();
+        let second = ProviderEvidence::with_occurrence(
+            Provider::NixDarwinLaunchd,
+            Subject::System,
+            ObservationComponent::Runtime,
+            Presence::Present,
+            launchd_occurrence("org.nix.gc", 2, 1),
+        )
+        .unwrap();
+        let forward = ProviderEvidenceSet::new(vec![first.clone(), second.clone()]).unwrap();
+        let reverse = ProviderEvidenceSet::new(vec![second.clone(), first.clone()]).unwrap();
+        assert_eq!(forward.entries(), reverse.entries());
+        assert!(ProviderEvidenceSet::new(vec![first.clone(), first.clone()]).is_err());
+        let conflicting = ProviderEvidence::with_occurrence(
+            Provider::NixDarwinLaunchd,
+            Subject::System,
+            ObservationComponent::Command,
+            Presence::Present,
+            launchd_occurrence("org.nix.other", 1, 0),
+        )
+        .unwrap();
+        assert!(ProviderEvidenceSet::new(vec![first.clone(), conflicting]).is_err());
+        let debug = format!("{:?}", first);
+        assert!(debug.contains("<opaque>"));
+        assert!(!debug.contains("org.nix.gc"));
+        assert!(LaunchdLabel::new("org.nix\ngc").is_err());
+        assert!(LaunchdLabel::new("org nix gc").is_ok());
+        let occurrence = DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(SourceRoot::CronieTable(SourceRootId::new(2)), 1),
+            CaptureSequence::new(0),
+        );
+        for presence in [
+            Presence::Absent,
+            Presence::PresentEmpty,
+            Presence::Present,
+            Presence::Unavailable(UnavailableReason::PermissionDenied),
+        ] {
+            assert!(
+                ProviderEvidence::with_occurrence(
+                    Provider::Cronie,
+                    Subject::System,
+                    ObservationComponent::Command,
+                    presence,
+                    occurrence.clone(),
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::Cronie,
+                Subject::Unresolved(SubjectOrdinal::new(1).unwrap()),
+                ObservationComponent::Command,
+                Presence::Unavailable(UnavailableReason::ExternalIdentityMayBeRelevant),
+                occurrence.clone(),
+            )
+            .is_ok()
+        );
+        let typed = |presence| {
+            ProviderEvidence::with_occurrence(
+                Provider::Cronie,
+                Subject::System,
+                ObservationComponent::Command,
+                presence,
+                occurrence.clone(),
+            )
+            .unwrap()
+        };
+        assert!(
+            ProviderEvidenceSet::new(vec![
+                typed(Presence::Present),
+                typed(Presence::Unavailable(UnavailableReason::PermissionDenied)),
+            ])
+            .is_ok()
+        );
+        assert!(
+            ProviderEvidenceSet::new(vec![
+                typed(Presence::Present),
+                typed(Presence::Unavailable(UnavailableReason::PermissionDenied)),
+                typed(Presence::Present),
+            ])
+            .is_err()
+        );
+        assert!(
+            ProviderEvidenceSet::new(vec![typed(Presence::Present), typed(Presence::Present)])
+                .is_err()
+        );
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::NixDarwinLaunchd,
+                Subject::System,
+                ObservationComponent::Runtime,
+                Presence::Present,
+                DefinitionOccurrence::new(
+                    ProviderLogicalKey::Launchd {
+                        domain: LaunchdDomain::System,
+                        subject: Subject::System,
+                        label: LaunchdLabel::new("org.nix.gc").unwrap(),
+                    },
+                    SourceOccurrenceKey::new(SourceRoot::SystemdUnit(SourceRootId::new(3)), 1,),
+                    CaptureSequence::new(0),
+                ),
+            )
+            .is_err()
+        );
+        let absent = ProviderEvidence::new(
+            Provider::Cronie,
+            Subject::System,
+            ObservationComponent::Command,
+            Presence::Absent,
+        )
+        .unwrap();
+        let present = ProviderEvidence::new(
+            Provider::Cronie,
+            Subject::System,
+            ObservationComponent::Command,
+            Presence::Present,
+        )
+        .unwrap();
+        assert!(ProviderEvidenceSet::new(vec![absent, present]).is_err());
+        let legacy = ProviderEvidence::new(
+            Provider::NixDarwinLaunchd,
+            Subject::System,
+            ObservationComponent::Runtime,
+            Presence::Present,
+        )
+        .unwrap();
+        assert!(ProviderEvidenceSet::new(vec![legacy, first]).is_err());
+    }
+
+    #[test]
+    fn normalized_ids_and_provider_scopes_are_explicit() {
+        let too_long = "x".repeat(129);
+        for value in ["", "bad\nvalue"] {
+            assert!(LaunchdLabel::new(value).is_err());
+            assert!(SystemdUnitId::new(value).is_err());
+            assert!(AnacronStateNamespace::new(value).is_err());
+            assert!(AnacronJobId::new(value).is_err());
+        }
+        assert!(LaunchdLabel::new(&too_long).is_err());
+        assert!(SystemdUnitId::new(&too_long).is_err());
+        assert!(AnacronStateNamespace::new(&too_long).is_err());
+        assert!(AnacronJobId::new(&too_long).is_err());
+
+        let systemd = DefinitionOccurrence::new(
+            ProviderLogicalKey::Systemd {
+                manager: SystemdManagerIdentity::System,
+                subject: Subject::System,
+                canonical_timer_id: SystemdUnitId::new("nix-gc.timer").unwrap(),
+            },
+            SourceOccurrenceKey::new(SourceRoot::SystemdUnit(SourceRootId::new(3)), 1),
+            CaptureSequence::new(0),
+        );
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::NixOsSystemd,
+                Subject::System,
+                ObservationComponent::Schedule,
+                Presence::Present,
+                systemd.clone(),
+            )
+            .is_ok()
+        );
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::NixDarwinLaunchd,
+                Subject::System,
+                ObservationComponent::Schedule,
+                Presence::Present,
+                systemd,
+            )
+            .is_err()
+        );
+
+        let anacron = DefinitionOccurrence::new(
+            ProviderLogicalKey::Anacron {
+                state_namespace: AnacronStateNamespace::new("system").unwrap(),
+                subject: Subject::System,
+                job_id: AnacronJobId::new("nix-gc").unwrap(),
+            },
+            SourceOccurrenceKey::new(SourceRoot::AnacronTable(SourceRootId::new(4)), 1),
+            CaptureSequence::new(0),
+        );
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::Anacron,
+                Subject::System,
+                ObservationComponent::Schedule,
+                Presence::Present,
+                anacron,
+            )
+            .is_ok()
+        );
     }
 }
