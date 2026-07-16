@@ -59,6 +59,7 @@ fn scope_and_platform_validation_is_explicit() {
     .unwrap();
     let values = ProviderEvidenceSet::new(vec![
         evidence(Subject::System, ObservationComponent::Discovery),
+        evidence(Subject::uid(1000), ObservationComponent::Discovery),
         entry,
     ])
     .unwrap();

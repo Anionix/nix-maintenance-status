@@ -215,13 +215,15 @@ pub fn validate_input(
         }
         ScanScope::Default
             if !has_system
-                || users.len() > 1
+                || users.len() != 1
                 || subjects.iter().any(|s| matches!(s, Subject::Unresolved(_))) =>
         {
             Err(InputError::InvalidScope)
         }
         ScanScope::AllUsers
-            if !has_system || subjects.iter().any(|s| matches!(s, Subject::Unresolved(0))) =>
+            if !has_system
+                || users.is_empty()
+                || subjects.iter().any(|s| matches!(s, Subject::Unresolved(0))) =>
         {
             Err(InputError::InvalidSubject)
         }
