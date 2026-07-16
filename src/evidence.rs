@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
     NixDarwinLaunchd,
@@ -21,6 +21,7 @@ impl Provider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Subject {
     System,
     Uid(u32),
@@ -125,8 +126,8 @@ impl ProviderEvidence {
 pub struct ProviderEvidenceSet(Vec<ProviderEvidence>);
 
 // LLM contract: construction accepts normalized observations, sorts by the
-// catalog provider order, and rejects an empty set, duplicate key, or
-// invalid unresolved identity; no later classifier may reinterpret these rows.
+// catalog provider order, and rejects an empty set or duplicate key; later
+// classifiers must preserve this order and never reinterpret normalized rows.
 impl ProviderEvidenceSet {
     pub fn new(mut entries: Vec<ProviderEvidence>) -> Result<Self, InputError> {
         if entries.is_empty() {
