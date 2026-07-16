@@ -111,7 +111,6 @@ pub enum InputError {
     InvalidScope,
     InvalidScanWindow,
     InvalidSubject,
-    CardinalityExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,9 +236,6 @@ pub(crate) fn validate_input(
     scope: ScanScope,
     entries: &ProviderEvidenceSet,
 ) -> Result<(), InputError> {
-    if entries.entries().len() > 4096 {
-        return Err(InputError::CardinalityExceeded);
-    }
     let platform_ok = |provider| match platform {
         TargetPlatform::MacOs => provider == Provider::NixDarwinLaunchd,
         TargetPlatform::Linux => provider != Provider::NixDarwinLaunchd,
