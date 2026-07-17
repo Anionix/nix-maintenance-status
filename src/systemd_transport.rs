@@ -317,9 +317,27 @@ mod linux {
                     crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
                 ));
             }
-            let values = self.properties(path, "org.freedesktop.systemd1.Service")?;
-            let rows = value::<Vec<ServiceExecStartRow>>(&values, "ExecStart")?;
-            let exec_start = normalize_service_exec_start(rows)?;
+            let values = match self.properties(path, "org.freedesktop.systemd1.Service") {
+                Ok(values) => values,
+                Err(error) => {
+                    println!("temporary systemd probe: service_properties=false");
+                    return Err(error);
+                }
+            };
+            let rows = match value::<Vec<ServiceExecStartRow>>(&values, "ExecStart") {
+                Ok(rows) => rows,
+                Err(error) => {
+                    println!("temporary systemd probe: exec_start_property=false");
+                    return Err(error);
+                }
+            };
+            let exec_start = match normalize_service_exec_start(rows) {
+                Ok(exec_start) => exec_start,
+                Err(error) => {
+                    println!("temporary systemd probe: exec_start_normalization=false");
+                    return Err(error);
+                }
+            };
             let wrapper = read_wrapper(exec_start.executable());
             println!(
                 "temporary systemd probe: wrapper_read={} bytes={}",
