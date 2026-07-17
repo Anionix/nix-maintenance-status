@@ -122,7 +122,7 @@ mod linux {
     // systemd v261 exposes a larger read-only property map for Service units
     // than for list rows; keep the map bounded without rejecting the official
     // NixOS service solely because optional properties were added.
-    const MAX_PROPERTY_ROWS: usize = 256;
+    const MAX_PROPERTY_ROWS: usize = 512;
     const MAX_TIMER_ENTRIES: usize = 128;
 
     #[derive(Debug, Clone)]
