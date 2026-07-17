@@ -127,7 +127,7 @@ in
   '' else ''
     machine.wait_for_unit("nix-gc.timer")
     machine.succeed("test \"$(systemctl show nix-gc.timer -p LoadState --value)\" = loaded")
-    machine.succeed("systemctl show nix-gc.service -p ExecStart | grep -F '${pkgs.coreutils}/bin/true'")
+    machine.succeed("wrapper=$(systemctl show nix-gc.service -p ExecStart | sed -n 's/.*path=\\([^; ]*\\).*/\\1/p'); test -x \"$wrapper\"; grep -F '/bin/true' \"$wrapper\"")
     machine.succeed("test \"$(systemctl show nix-gc.service -p ActiveState --value)\" = inactive")
     machine.succeed("systemctl show nix-gc.timer -p LoadState --value | grep -Fx loaded")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
