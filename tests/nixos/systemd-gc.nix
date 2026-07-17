@@ -15,7 +15,7 @@ in
   name = "nix-maintenance-status-systemd-${variant}";
   requiredFeatures.kvm = false;
 
-  # This is a fixture-conformance VM, not the Linux CLI. The Rust transport's
+  # This VM is not the Linux CLI. The Rust transport's
   # malformed-reply and changed-during-read cases remain pure tests because
   # systemd v261 exposes no read-generation property. No authority is inferred
   # from Manager.Version or from these guest observations.
@@ -134,7 +134,7 @@ in
     machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user command=not-applicable observations=3'")
     machine.fail("test -S /run/user/1001/bus")
     machine.succeed("test -S /run/dbus/system_bus_socket")
-    noJob.fail("systemctl show nix-gc.timer")
+    noJob.succeed("test -z \"$(systemctl show nix-gc.timer -p FragmentPath --value)\"")
     noJob.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system command=unknown observations=4'")
     unloaded.succeed("systemctl list-unit-files --no-legend nix-gc.timer | grep -F nix-gc.timer")
     unloaded.fail("systemctl list-units --all --no-legend nix-gc.timer | grep -F nix-gc.timer")
