@@ -1097,6 +1097,14 @@ mod tests {
             )
         ));
         assert!(matches!(
+            claims.consistency().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::ConsistencyNotAttested
+                )
+            )
+        ));
+        assert!(matches!(
             claims.command().conclusion(),
             crate::diagnostic::Conclusion::Known(crate::report::ObservationValue::Present)
         ));
