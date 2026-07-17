@@ -74,7 +74,7 @@ fn snapshot_with_config(
 const REVISION: &str = "e8d924d50a462f89166e31a27bdcbbade35fd8e6";
 
 #[test]
-fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
+fn exact_gc_timer_observation_preserves_schedule_without_authority_injection() {
     let report = normalize_systemd_snapshot(
         snapshot(
             SystemdManagerIdentity::System,
@@ -88,15 +88,15 @@ fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
     .unwrap();
     assert!(matches!(
         report.authority(),
-        AuthorityResolution::Resolved(_)
+        AuthorityResolution::Unresolved(_)
     ));
-    assert_eq!(report.evidence().entries().len(), 3);
+    assert_eq!(report.evidence().entries().len(), 4);
     assert!(
         report
             .evidence()
             .entries()
             .iter()
-            .all(|entry| entry.occurrence().is_some())
+            .all(|entry| entry.occurrence().is_none())
     );
 }
 
@@ -173,6 +173,24 @@ fn configuration_and_runtime_remain_independent() {
             .presence(),
         Presence::Unavailable(UnavailableReason::PermissionDenied)
     );
+}
+
+#[test]
+fn command_unknown_does_not_erase_schedule() {
+    let report = normalize_systemd_snapshot(
+        snapshot(
+            SystemdManagerIdentity::System,
+            "nix-gc.timer",
+            Presence::Present,
+            3,
+            Ok(Some(properties("nix-gc.service"))),
+        ),
+        REVISION,
+    )
+    .unwrap();
+    assert!(report.evidence().entries().iter().any(|entry| {
+        entry.component() == ObservationComponent::Schedule && entry.presence() == Presence::Present
+    }));
 }
 
 #[test]
@@ -293,7 +311,7 @@ fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
     .unwrap();
     assert!(matches!(
         changed.authority(),
-        AuthorityResolution::Resolved(_)
+        AuthorityResolution::Unresolved(_)
     ));
     assert_identity_free(&changed);
 
