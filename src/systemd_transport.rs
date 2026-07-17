@@ -186,10 +186,10 @@ mod linux {
             for (name, usec, _) in value::<Vec<(String, u64, u64)>>(&values, "TimersMonotonic")? {
                 triggers.push(monotonic_trigger(&name, usec)?);
             }
-            for (expression, timezone, _) in
+            for (base, expression, _) in
                 value::<Vec<(String, String, u64)>>(&values, "TimersCalendar")?
             {
-                if !timezone.is_empty() {
+                if !base.is_empty() {
                     return Err(SystemdBusError::InvalidSignature);
                 }
                 triggers.push(SystemdTrigger::OnCalendar(expression));
