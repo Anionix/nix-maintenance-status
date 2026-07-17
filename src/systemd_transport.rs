@@ -367,7 +367,7 @@ mod linux {
     // LLM contract: exactly one typed read-signature row is required for the
     // generated service. The write signature, duplicate rows, malformed text,
     // and raw variants never cross this boundary.
-    fn normalize_service_exec_start(
+    pub(super) fn normalize_service_exec_start(
         rows: Vec<ServiceExecStartRow>,
     ) -> Result<SystemdExecStart, SystemdBusError> {
         if rows.len() != 1 {
