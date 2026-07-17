@@ -1,5 +1,11 @@
+use crate::catalog::{AuthorityResolution, AuthorityRole};
 use crate::evidence::{
-    InputError, ProviderEvidenceSet, ScanScope, ScanWindow, TargetPlatform, validate_input,
+    InputError, ProviderEvidenceSet, ScanScope, ScanWindow, TargetPlatform, UnavailableReason,
+    validate_input,
+};
+use crate::report::{
+    CoverageMatrix, EvidenceId, EvidenceLedger, GcAutomation, ScanMetadata, build_inventory,
+    build_ledger,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +114,7 @@ pub enum EvidenceClass {
 #[non_exhaustive]
 pub enum UnknownReason {
     ProbeFailed(ProbeFailure),
+    EvidenceUnavailable(UnavailableReason),
     DependentClaimUnknown,
 }
 
@@ -117,12 +124,29 @@ pub enum Conclusion<T> {
     Unknown(UnknownReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Provenance(EvidenceClass);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    class: EvidenceClass,
+    evidence: Vec<EvidenceId>,
+    authorities: [AuthorityResolution; 3],
+}
 
 impl Provenance {
     pub const fn evidence_class(&self) -> EvidenceClass {
-        self.0
+        self.class
+    }
+    pub fn evidence_ids(&self) -> &[EvidenceId] {
+        &self.evidence
+    }
+    pub const fn authorities(&self) -> &[AuthorityResolution; 3] {
+        &self.authorities
+    }
+    pub const fn authority(&self, role: AuthorityRole) -> AuthorityResolution {
+        self.authorities[match role {
+            AuthorityRole::GcOperationSemantics => 0,
+            AuthorityRole::AutomationMapping => 1,
+            AuthorityRole::SchedulerSemantics => 2,
+        }]
     }
 }
 
@@ -144,14 +168,44 @@ impl<T> Claim<T> {
     fn known(value: T, class: EvidenceClass) -> Self {
         Self {
             conclusion: Conclusion::Known(value),
-            provenance: Provenance(class),
+            provenance: Provenance {
+                class,
+                evidence: Vec::new(),
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
         }
     }
 
-    fn unknown(reason: UnknownReason) -> Self {
+    pub(crate) fn unknown(reason: UnknownReason) -> Self {
         Self {
             conclusion: Conclusion::Unknown(reason),
-            provenance: Provenance(EvidenceClass::Unknown),
+            provenance: Provenance {
+                class: EvidenceClass::Unknown,
+                evidence: Vec::new(),
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
+        }
+    }
+
+    pub(crate) fn observed(value: T, ids: Vec<EvidenceId>) -> Self {
+        Self {
+            conclusion: Conclusion::Known(value),
+            provenance: Provenance {
+                class: EvidenceClass::Observed,
+                evidence: ids,
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
+        }
+    }
+
+    pub(crate) fn unavailable(reason: UnavailableReason, ids: Vec<EvidenceId>) -> Self {
+        Self {
+            conclusion: Conclusion::Unknown(UnknownReason::EvidenceUnavailable(reason)),
+            provenance: Provenance {
+                class: EvidenceClass::Unknown,
+                evidence: ids,
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
         }
     }
 }
@@ -182,6 +236,10 @@ pub struct GcReport {
     configuration: Claim<ConfigurationState>,
     runtime: Claim<RuntimeState>,
     consistency: Claim<ConsistencyState>,
+    scan: ScanMetadata,
+    coverage: CoverageMatrix,
+    automations: Vec<GcAutomation>,
+    evidence: EvidenceLedger,
 }
 
 impl GcReport {
@@ -194,25 +252,52 @@ impl GcReport {
     pub const fn consistency(&self) -> &Claim<ConsistencyState> {
         &self.consistency
     }
+    pub const fn scan(&self) -> &ScanMetadata {
+        &self.scan
+    }
+    pub const fn coverage(&self) -> &CoverageMatrix {
+        &self.coverage
+    }
+    pub fn automations(&self) -> &[GcAutomation] {
+        &self.automations
+    }
+    pub const fn evidence(&self) -> &EvidenceLedger {
+        &self.evidence
+    }
 }
 
 // LLM contract: plist and launchd Probes independently become Known for Observed/Absent
 // or Unknown for Unavailable. Consistency is Known only when both core Claims are Known;
 // equal presence is Consistent. Runtime never changes Configuration; Unknown is not Absent.
-// A generic validated input intentionally takes the unknown_report placeholder until the
-// report-classifier slice; it never reuses the legacy plist inference.
+// Generic validated input is classified into the immutable inventory boundary;
+// legacy MacOsEvidence retains the 0.1 core getters only during the migration
+// window and never feeds those getters from generic provider Evidence.
 pub fn diagnose(input: DiagnosticInput) -> GcReport {
-    let Some(evidence) = input.legacy else {
-        return unknown_report();
+    let scan = ScanMetadata::new(input.platform(), input.scope(), input.window());
+    let Some(legacy) = input.legacy else {
+        let evidence = input
+            .evidence()
+            .expect("validated generic input has evidence");
+        let ledger = build_ledger(&input).unwrap_or_else(|_| EvidenceLedger::empty());
+        let (automations, coverage) = build_inventory(evidence, &ledger);
+        return GcReport {
+            configuration: Claim::unknown(UnknownReason::DependentClaimUnknown),
+            runtime: Claim::unknown(UnknownReason::DependentClaimUnknown),
+            consistency: Claim::unknown(UnknownReason::DependentClaimUnknown),
+            scan,
+            coverage,
+            automations,
+            evidence: ledger,
+        };
     };
     let (configuration, configured) = claim_from_probe(
-        evidence.0,
+        legacy.0,
         ConfigurationState::ConsistentWithNixDarwinAutomaticGc,
         ConfigurationState::NotDetected,
         EvidenceClass::Inferred,
     );
     let (runtime, loaded) = claim_from_probe(
-        evidence.1,
+        legacy.1,
         RuntimeState::Loaded,
         RuntimeState::NotLoaded,
         EvidenceClass::Observed,
@@ -233,14 +318,10 @@ pub fn diagnose(input: DiagnosticInput) -> GcReport {
         configuration,
         runtime,
         consistency,
-    }
-}
-
-fn unknown_report() -> GcReport {
-    GcReport {
-        configuration: Claim::unknown(UnknownReason::DependentClaimUnknown),
-        runtime: Claim::unknown(UnknownReason::DependentClaimUnknown),
-        consistency: Claim::unknown(UnknownReason::DependentClaimUnknown),
+        scan,
+        coverage: CoverageMatrix::empty(),
+        automations: Vec::new(),
+        evidence: EvidenceLedger::empty(),
     }
 }
 
