@@ -582,7 +582,7 @@ fn validate_catalog(entries: &[AuthorityRef]) -> Result<(), CatalogError> {
         if entry
             .integrity
             .iter()
-            .any(|pin| !valid_text(pin.label) || !valid_text(pin.digest))
+            .any(|pin| !valid_text(pin.label) || !valid_digest(pin.digest))
         {
             return Err(CatalogError::InvalidIdentity);
         }
@@ -1277,5 +1277,19 @@ mod tests {
         );
         assert!(!debug.contains("/Library/LaunchDaemons"));
         assert!(!debug.contains("nix-collect-garbage --delete-old"));
+    }
+
+    #[test]
+    fn integrity_pins_require_sha256_digests() {
+        let mut entry = CATALOG[0];
+        const INVALID: &[IntegrityPin] = &[IntegrityPin {
+            label: "package",
+            digest: "not-a-digest",
+        }];
+        entry.integrity = INVALID;
+        assert!(matches!(
+            validate_catalog(&[entry]),
+            Err(CatalogError::InvalidIdentity)
+        ));
     }
 }
