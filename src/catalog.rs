@@ -792,8 +792,20 @@ const NIX_CITATIONS: &[SourceCitation] = &[
         url: "https://github.com/NixOS/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/src/nix/nix-collect-garbage/nix-collect-garbage.cc",
     },
     SourceCitation {
+        title: "Nix store command implementation",
+        url: "https://github.com/NixOS/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/src/nix/nix-store/nix-store.cc",
+    },
+    SourceCitation {
         title: "Nix store garbage collection implementation",
         url: "https://github.com/NixOS/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/src/nix/store-gc.cc",
+    },
+    SourceCitation {
+        title: "Nix garbage collection command manual",
+        url: "https://github.com/NixOS/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/doc/manual/source/command-ref/nix-collect-garbage.md",
+    },
+    SourceCitation {
+        title: "Nix store garbage collection manual",
+        url: "https://github.com/NixOS/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/doc/manual/source/command-ref/nix-store/gc.md",
     },
 ];
 const DARWIN_CITATIONS: &[SourceCitation] = &[
