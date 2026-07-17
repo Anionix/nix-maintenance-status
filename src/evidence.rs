@@ -430,8 +430,13 @@ impl ProviderEvidence {
         self.schedule.as_ref()
     }
     pub fn with_schedule(mut self, schedule: Schedule) -> Result<Self, InputError> {
+        let provider_matches = matches!(
+            (&self.provider, &schedule),
+            (Provider::NixDarwinLaunchd, Schedule::Launchd(_))
+                | (Provider::NixOsSystemd, Schedule::Systemd(_))
+        );
         if self.component != ObservationComponent::Schedule
-            || self.provider != Provider::NixDarwinLaunchd
+            || !provider_matches
             || self.presence != Presence::Present
         {
             return Err(InputError::InvalidNormalizedValue);
