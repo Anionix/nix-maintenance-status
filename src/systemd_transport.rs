@@ -5,9 +5,8 @@ use crate::systemd_adapter::SystemdBusError;
 use crate::evidence::{CaptureSequence, Presence, SourceRootId};
 #[cfg(target_os = "linux")]
 use crate::systemd_adapter::{
-    NIX_GC_SERVICE, NIX_GC_TIMER, SystemdAuthorityIdentity, SystemdBusSnapshot,
-    SystemdCommandIdentity, SystemdExecStart, SystemdTimerProperties, classify_nix_gc_command,
-    normalize_nix_gc_state,
+    NIX_GC_SERVICE, NIX_GC_TIMER, SystemdBusSnapshot, SystemdCommandIdentity, SystemdExecStart,
+    SystemdTimerProperties, classify_nix_gc_command, normalize_nix_gc_state,
 };
 
 pub const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
@@ -152,13 +151,14 @@ mod linux {
         // loaded, and timer-property results. Only the exact nix-gc.timer
         // lookup may become Absent; malformed or inaccessible values remain
         // Unavailable. systemd v261 has no read-generation, so this sequence
-        // is not advertised as an atomic consistency proof.
+        // is not advertised as an atomic consistency proof. The transport
+        // does not invent NixOS package/patch authority when those pins are
+        // not locally observed; the snapshot remains identity-free.
         pub fn probe_nix_gc(
             &self,
             source: SourceRootId,
             capture: CaptureSequence,
         ) -> Result<SystemdBusSnapshot, SystemdTransportError> {
-            let authority_identity = self.authority_identity();
             let configured = self.configured();
             let loaded = self.loaded();
             let properties = if loaded == Presence::Present {
@@ -194,24 +194,8 @@ mod linux {
                 loaded,
                 properties,
             )
-            .map(|snapshot| {
-                snapshot
-                    .with_command(command)
-                    .with_authority_identity(authority_identity)
-            })
+            .map(|snapshot| snapshot.with_command(command))
             .map_err(SystemdTransportError::InvalidInput)
-        }
-
-        // LLM contract: only the typed Manager.Version property may create a
-        // systemd ContractPin identity. Missing, malformed, or non-catalogued
-        // versions stay None; this probe never accepts caller Authority or
-        // performs network, mutation, telemetry, elevation, or GC execution.
-        fn authority_identity(&self) -> Option<SystemdAuthorityIdentity> {
-            let values = self
-                .properties_path(SYSTEMD_MANAGER_PATH, SYSTEMD_MANAGER_INTERFACE)
-                .ok()?;
-            let version = value::<String>(&values, "Version").ok()?;
-            SystemdAuthorityIdentity::from_version(&version)
         }
 
         fn configured(&self) -> Presence {
@@ -468,11 +452,7 @@ mod linux {
     fn effective_unit(values: &HashMap<String, OwnedValue>) -> Result<bool, SystemdBusError> {
         let fragment = value::<String>(values, "FragmentPath")?;
         let dropins = value::<Vec<String>>(values, "DropInPaths")?;
-        if fragment.chars().any(char::is_control)
-            || (!fragment.ends_with("/nix-gc.service")
-                || (fragment != "/etc/systemd/system/nix-gc.service"
-                    && !crate::systemd_adapter::is_safe_store_path(&fragment)))
-        {
+        if fragment.chars().any(char::is_control) || !is_generated_fragment(&fragment) {
             return Ok(false);
         }
         if dropins.iter().any(|path| {
@@ -481,6 +461,23 @@ mod linux {
             return Err(SystemdBusError::InvalidSignature);
         }
         Ok(dropins.is_empty())
+    }
+
+    fn is_generated_fragment(path: &str) -> bool {
+        if path == "/etc/systemd/system/nix-gc.service" {
+            return true;
+        }
+        let Some(object) = path
+            .strip_prefix("/nix/store/")
+            .and_then(|rest| rest.split('/').next())
+        else {
+            return false;
+        };
+        crate::systemd_adapter::is_safe_store_path(path)
+            && path.ends_with("/nix-gc.service")
+            && object
+                .split_once('-')
+                .is_some_and(|(_, name)| name.starts_with("unit-"))
     }
 
     // LLM contract: an empty exact reply is Absent, one exact row is Present,

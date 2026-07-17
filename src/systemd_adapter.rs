@@ -336,15 +336,20 @@ fn safe_gc_age(value: &str) -> bool {
         return false;
     };
     matches!(unit, 's' | 'm' | 'h' | 'd' | 'w' | 'M' | 'y')
-        && value[..value.len() - unit.len_utf8()]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit())
-        && value.len() > 1
+        && bounded_digits(&value[..value.len() - unit.len_utf8()])
 }
 
 #[allow(dead_code)]
 fn safe_gc_bytes(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    let (digits, suffix) = value
+        .strip_suffix(|byte: char| matches!(byte, 'K' | 'M' | 'G' | 'T'))
+        .map_or((value, None), |digits| (digits, value.chars().last()));
+    suffix.is_none_or(|_| !digits.is_empty()) && bounded_digits(digits)
+}
+
+#[allow(dead_code)]
+fn bounded_digits(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,10 +724,14 @@ pub fn normalize_systemd_snapshot(
         )?,
     ];
     if snapshot.manager == SystemdManagerIdentity::System {
-        let command_presence = match snapshot.command {
-            Ok(Some(command)) => command.presence(),
-            Ok(None) => Presence::Unavailable(UnavailableReason::MalformedEvidence),
-            Err(error) => error.presence(),
+        let command_presence = if changed {
+            Presence::Unavailable(UnavailableReason::ChangedDuringRead)
+        } else {
+            match snapshot.command {
+                Ok(Some(command)) => command.presence(),
+                Ok(None) => Presence::Unavailable(UnavailableReason::MalformedEvidence),
+                Err(error) => error.presence(),
+            }
         };
         entries.push(make_evidence(
             ObservationComponent::Command,
@@ -905,7 +914,15 @@ mod tests {
         )
         .unwrap()
         .with_command(Ok(Some(command)))
-        .with_authority_identity(SystemdAuthorityIdentity::from_version("261"));
+        .with_authority_identity(Some(
+            SystemdAuthorityIdentity::from_pins(
+                "261",
+                FIXTURE_REVISION,
+                PACKAGE_DIGEST,
+                PATCH_DIGEST,
+            )
+            .unwrap(),
+        ));
         let report =
             normalize_systemd_snapshot(snapshot, "e8d924d50a462f89166e31a27bdcbbade35fd8e6")
                 .unwrap();
