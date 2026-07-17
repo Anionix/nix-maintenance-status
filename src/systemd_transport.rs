@@ -86,7 +86,11 @@ mod linux {
         // unavailable bus becomes typed Unavailable and no environment,
         // network address, retry, elevation, or telemetry is consulted.
         pub fn connect(scope: SystemdBusScope) -> Result<Self, SystemdTransportError> {
-            let connection = zbus::blocking::connection::Builder::address(scope.unix_address())
+            let address: zbus::Address = scope
+                .unix_address()
+                .parse()
+                .map_err(|_| SystemdBusError::Disconnected)?;
+            let connection = zbus::blocking::connection::Builder::address(address)
                 .map_err(|_| SystemdBusError::Disconnected)?
                 .build()
                 .map_err(|error| map_zbus_error(&error))?;
@@ -173,7 +177,10 @@ mod linux {
         ) -> Result<SystemdTimerProperties, SystemdBusError> {
             let values = self.properties(path, SYSTEMD_TIMER_INTERFACE)?;
             let target = value::<String>(&values, "Unit")
-                .and_then(|value| crate::evidence::SystemdUnitId::new(&value))
+                .and_then(|value| {
+                    crate::evidence::SystemdUnitId::new(&value)
+                        .map_err(|_| SystemdBusError::InvalidSignature)
+                })
                 .map_err(|_| SystemdBusError::InvalidSignature)?;
             let mut triggers = Vec::new();
             for (name, usec, _) in value::<Vec<(String, u64, u64)>>(&values, "TimersMonotonic")? {
@@ -228,7 +235,7 @@ mod linux {
         ) -> Result<T, SystemdBusError>
         where
             B: serde::Serialize + zbus::zvariant::DynamicType,
-            T: serde::de::DeserializeOwned,
+            T: serde::de::DeserializeOwned + zbus::zvariant::Type,
         {
             let reply = self
                 .connection
@@ -310,7 +317,7 @@ mod linux {
         }
     }
 
-    pub use SystemdBusTransport as Transport;
+    pub use self::SystemdBusTransport as Transport;
 }
 
 #[cfg(target_os = "linux")]
