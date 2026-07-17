@@ -175,27 +175,14 @@ mod linux {
             let expected_service = crate::evidence::SystemdUnitId::new(NIX_GC_SERVICE)
                 .map_err(SystemdTransportError::InvalidInput)?;
             let command = match &properties {
-                Ok(Some(properties)) if properties.target() == &expected_service => {
-                    println!("temporary systemd probe: timer_target=expected");
-                    let service_path = self.unit_path(NIX_GC_SERVICE);
-                    println!(
-                        "temporary systemd probe: service_unit_path={}",
-                        service_path.is_ok()
-                    );
-                    service_path
-                        .and_then(|path| self.service_command(&path))
-                        .map(Some)
-                }
-                Ok(Some(_)) => {
-                    println!("temporary systemd probe: timer_target=mismatch");
-                    Ok(Some(SystemdCommandIdentity::unknown(
-                        crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
-                    )))
-                }
-                Ok(None) => {
-                    println!("temporary systemd probe: timer_properties=none");
-                    Ok(None)
-                }
+                Ok(Some(properties)) if properties.target() == &expected_service => self
+                    .unit_path(NIX_GC_SERVICE)
+                    .and_then(|path| self.service_command(&path))
+                    .map(Some),
+                Ok(Some(_)) => Ok(Some(SystemdCommandIdentity::unknown(
+                    crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
+                ))),
+                Ok(None) => Ok(None),
                 Err(error) => Err(*error),
             };
             // systemd v261 exposes no Manager.Generation property. Keep that
@@ -307,57 +294,21 @@ mod linux {
             &self,
             path: &OwnedObjectPath,
         ) -> Result<SystemdCommandIdentity, SystemdBusError> {
-            let unit_values = match self.properties(path, "org.freedesktop.systemd1.Unit") {
-                Ok(values) => values,
-                Err(error) => {
-                    println!("temporary systemd probe: service_unit_properties=false");
-                    return Err(error);
-                }
-            };
-            let effective = effective_unit(&unit_values)?;
-            println!("temporary systemd probe: effective_unit={effective}");
-            if !effective {
+            let unit_values = self.properties(path, "org.freedesktop.systemd1.Unit")?;
+            if !effective_unit(&unit_values)? {
                 return Ok(SystemdCommandIdentity::unknown(
                     crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
                 ));
             }
-            let values = match self.properties(path, "org.freedesktop.systemd1.Service") {
-                Ok(values) => values,
-                Err(error) => {
-                    println!("temporary systemd probe: service_properties=false");
-                    return Err(error);
-                }
-            };
-            let rows = match value::<Vec<ServiceExecStartRow>>(&values, "ExecStart") {
-                Ok(rows) => rows,
-                Err(error) => {
-                    println!("temporary systemd probe: exec_start_property=false");
-                    return Err(error);
-                }
-            };
-            let exec_start = match normalize_service_exec_start(rows) {
-                Ok(exec_start) => exec_start,
-                Err(error) => {
-                    println!("temporary systemd probe: exec_start_normalization=false");
-                    return Err(error);
-                }
-            };
+            let values = self.properties(path, "org.freedesktop.systemd1.Service")?;
+            let rows = value::<Vec<ServiceExecStartRow>>(&values, "ExecStart")?;
+            let exec_start = normalize_service_exec_start(rows)?;
             let wrapper = read_wrapper(exec_start.executable());
-            println!(
-                "temporary systemd probe: wrapper_read={} bytes={}",
-                wrapper.is_ok(),
-                wrapper.as_ref().map_or(0, Vec::len)
-            );
             let wrapper = wrapper
                 .as_ref()
                 .map(|bytes| bytes.as_slice())
                 .map_err(|error| *error);
-            let identity = classify_nix_gc_command(&exec_start, wrapper);
-            println!(
-                "temporary systemd probe: command_exact={}",
-                identity.is_exact()
-            );
-            Ok(identity)
+            Ok(classify_nix_gc_command(&exec_start, wrapper))
         }
 
         fn properties(
@@ -381,16 +332,6 @@ mod linux {
                 ReadOnlyMethod::GetAll,
                 &(interface,),
             )?;
-            println!(
-                "temporary systemd probe: property_count={} interface_known={}",
-                values.len(),
-                matches!(
-                    interface,
-                    "org.freedesktop.systemd1.Unit"
-                        | "org.freedesktop.systemd1.Service"
-                        | SYSTEMD_TIMER_INTERFACE
-                )
-            );
             if values.len() > MAX_PROPERTY_ROWS {
                 Err(SystemdBusError::ResourceLimitExceeded)
             } else {
