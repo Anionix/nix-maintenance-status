@@ -402,7 +402,7 @@ mod linux {
         if canonical != std::path::Path::new(path) {
             return Err(SystemdBusError::OperationFailed);
         }
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
