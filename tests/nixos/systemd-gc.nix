@@ -117,6 +117,7 @@ in
     machine.wait_for_unit("user@1000.service")
     machine.succeed("test -S /run/user/1000/bus")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
+    machine.log(machine.succeed("systemctl show nix-gc.service -p FragmentPath -p DropInPaths -p ExecStart"))
     machine.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system command=present observations=4'")
     machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user command=not-applicable observations=3'")
     machine.fail("test -S /run/user/1001/bus")
