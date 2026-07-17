@@ -117,6 +117,8 @@ in
     machine.succeed("grep -Fx 'systemd-source=${expectedSystemdSourceHash}' /etc/nix-maintenance-status/pins")
     machine.succeed("grep -Fx 'nixpkgs-patches=${lib.concatStringsSep "," expectedNixpkgsPatches}' /etc/nix-maintenance-status/pins")
     machine.succeed("test -S /run/dbus/system_bus_socket")
+    machine.wait_for_unit("user@1000.service")
+    machine.succeed("test -S /run/user/1000/bus")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
     machine.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\" | grep -E '^scope=system command=present observations=[0-9]+$' || { echo \"$output\" >&2; exit 1; }")
     machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user command=not-applicable observations=3'")
@@ -125,6 +127,8 @@ in
   '' else ''
     machine.wait_for_unit("nix-gc.timer")
     machine.succeed("test \"$(systemctl show nix-gc.timer -p LoadState --value)\" = loaded")
+    machine.wait_for_unit("user@1000.service")
+    machine.succeed("test -S /run/user/1000/bus")
     machine.succeed("wrapper=$(systemctl show nix-gc.service -p ExecStart | sed -n 's/.*path=\\([^; ]*\\).*/\\1/p'); test -x \"$wrapper\"; grep -F '/bin/true' \"$wrapper\"")
     machine.succeed("test \"$(systemctl show nix-gc.service -p ActiveState --value)\" = inactive")
     machine.succeed("systemctl show nix-gc.timer -p LoadState --value | grep -Fx loaded")
