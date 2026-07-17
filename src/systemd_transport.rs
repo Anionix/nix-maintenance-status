@@ -173,7 +173,12 @@ mod linux {
             let command = match &properties {
                 Ok(Some(properties)) if properties.target() == &expected_service => {
                     println!("temporary systemd probe: timer_target=expected");
-                    self.unit_path(NIX_GC_SERVICE)
+                    let service_path = self.unit_path(NIX_GC_SERVICE);
+                    println!(
+                        "temporary systemd probe: service_unit_path={}",
+                        service_path.is_ok()
+                    );
+                    service_path
                         .and_then(|path| self.service_command(&path))
                         .map(Some)
                 }
@@ -298,7 +303,13 @@ mod linux {
             &self,
             path: &OwnedObjectPath,
         ) -> Result<SystemdCommandIdentity, SystemdBusError> {
-            let unit_values = self.properties(path, "org.freedesktop.systemd1.Unit")?;
+            let unit_values = match self.properties(path, "org.freedesktop.systemd1.Unit") {
+                Ok(values) => values,
+                Err(error) => {
+                    println!("temporary systemd probe: service_unit_properties=false");
+                    return Err(error);
+                }
+            };
             if !effective_unit(&unit_values)? {
                 return Ok(SystemdCommandIdentity::unknown(
                     crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
