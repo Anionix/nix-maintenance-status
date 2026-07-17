@@ -217,7 +217,11 @@ pub(crate) fn classify_nix_gc_command(
     {
         return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
     }
+    // NixOS's writeShellScriptBin appends one template newline after the
+    // script's own final newline. Accept that exact two-newline form (or the
+    // one-newline form used by hand-built fixtures), but reject extra lines.
     let script = &script[..script.len() - 1];
+    let script = script.strip_suffix('\n').unwrap_or(script);
     let lines: Vec<_> = script.split('\n').collect();
     let command_line = match lines.as_slice() {
         [shebang, strict, blank, command]
@@ -833,7 +837,7 @@ mod tests {
         assert!(classify_nix_gc_command(
             &exec,
             Ok(format!(
-                "#!/nix/store/{STORE_HASH}-bash-5/bin/bash\nset -e\n\nexec /nix/store/{STORE_HASH}-nix-2.0/bin/nix-collect-garbage --delete-old\n"
+                "#!/nix/store/{STORE_HASH}-bash-5/bin/bash\nset -e\n\nexec /nix/store/{STORE_HASH}-nix-2.0/bin/nix-collect-garbage --delete-old\n\n"
             ).as_bytes()),
         ).is_exact());
         assert!(
