@@ -647,10 +647,9 @@ fn occurrence(snapshot: &SystemdBusSnapshot) -> DefinitionOccurrence {
 }
 
 // LLM contract: normalization is triggered by one typed, bounded snapshot.
-// A catalogued system nix-gc.timer plus nix-gc.service target, exact command,
-// observed systemd ContractPin, mapping, operation authority, and attested
-// generation are all required for an occurrence; unknown/user/foreign
-// identities retain identity-free evidence. Generation changes become local Unavailable evidence.
+// LLM contract: a system nix-gc.timer/service target plus exact generated
+// command admits a structural candidate; Authority and generation only govern
+// claim officiality/consistency, so Unknown never erases inventory membership.
 // NoSuchUnit is Absent only for the finite helper, all other bus failures stay
 // Unavailable, and no path performs I/O, retries, mutation, telemetry, or GC.
 // A transport without an official read-generation supplies no consistency
@@ -669,13 +668,6 @@ pub fn normalize_systemd_snapshot(
         AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityUnavailable),
         SystemdAuthorityIdentity::resolution,
     );
-    let is_mapping = matches!(
-        observed_authority,
-        AuthorityResolution::Resolved(reference)
-            if reference.entry_id().as_str() == "nixos.gc.mapping.v1"
-                && reference.role() == AuthorityRole::AutomationMapping
-                && reference.scope() == CatalogScope::Provider(Provider::NixOsSystemd)
-    );
     let expected_timer =
         SystemdUnitId::new(NIX_GC_TIMER).expect("catalogued Nix timer identity is valid");
     let expected_service =
@@ -683,8 +675,7 @@ pub fn normalize_systemd_snapshot(
     let changed = snapshot.generation_changed();
     let generation_attested = snapshot.generation_attested();
     let unstable = changed || !generation_attested;
-    let has_gc_identity = snapshot.manager == SystemdManagerIdentity::System
-        && generation_attested
+    let structural_identity = snapshot.manager == SystemdManagerIdentity::System
         && snapshot.unit == expected_timer
         && matches!(
             snapshot.properties.as_ref(),
@@ -694,11 +685,9 @@ pub fn normalize_systemd_snapshot(
             snapshot.command,
             Ok(Some(command)) if command.is_exact()
         )
-        && snapshot.authority_identity.is_some()
-        && matches!(operation_authority, AuthorityResolution::Resolved(_))
-        && is_mapping;
-    let occurrence = (!unstable && has_gc_identity).then(|| occurrence(&snapshot));
-    let authority = if has_gc_identity {
+        && matches!(operation_authority, AuthorityResolution::Resolved(_));
+    let occurrence = structural_identity.then(|| occurrence(&snapshot));
+    let authority = if structural_identity {
         observed_authority
     } else if snapshot.manager == SystemdManagerIdentity::User {
         AuthorityResolution::NotApplicable
@@ -1038,7 +1027,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_generation_keeps_systemd_identity_and_schedule_unknown() {
+    fn missing_generation_keeps_structural_candidate_and_schedule_unknown() {
+        let target = SystemdUnitId::new(NIX_GC_SERVICE).unwrap();
+        let properties = SystemdTimerProperties::new(
+            target,
+            vec![SystemdTrigger::OnCalendar("03:15:00".to_owned())],
+            SystemdTimerPolicy::new(None, None, false, None, false, false, false),
+        )
+        .unwrap();
+        let path = format!("/nix/store/{STORE_HASH}-unit-script-nix-gc-start/bin/nix-gc-start");
+        let exec = SystemdExecStart::from_read_signature(&path, std::slice::from_ref(&path), false)
+            .unwrap();
+        let command = classify_nix_gc_command(
+            &exec,
+            Ok(format!(
+                "#!/nix/store/{STORE_HASH}-bash-5/bin/bash\nset -e\n\nexec /nix/store/{STORE_HASH}-nix-2.0/bin/nix-collect-garbage --delete-old\n"
+            ).as_bytes()),
+        );
         let snapshot = SystemdBusSnapshot::without_generation(
             SystemdManagerIdentity::System,
             Subject::System,
@@ -1047,23 +1052,53 @@ mod tests {
             CaptureSequence::new(1),
             Presence::Present,
             Presence::Present,
-            Ok(None),
+            Ok(Some(properties)),
         )
-        .unwrap();
+        .unwrap()
+        .with_command(Ok(Some(command)));
         let report =
-            normalize_systemd_snapshot(snapshot, "e8d924d50a462f89166e31a27bdcbbade35fd8e6")
+            normalize_systemd_snapshot(snapshot, "0000000000000000000000000000000000000000")
                 .unwrap();
         assert!(
             report
                 .evidence()
                 .entries()
                 .iter()
-                .all(|entry| entry.occurrence().is_none())
+                .all(|entry| entry.occurrence().is_some())
         );
         assert!(report.evidence().entries().iter().any(|entry| {
             entry.component() == ObservationComponent::Schedule
                 && entry.presence()
                     == Presence::Unavailable(UnavailableReason::ConsistencyNotAttested)
         }));
+        let input = crate::diagnostic::DiagnosticInput::new(
+            crate::evidence::TargetPlatform::Linux,
+            crate::evidence::ScanScope::System,
+            crate::evidence::ScanWindow::new(std::time::UNIX_EPOCH, Duration::from_secs(1))
+                .unwrap(),
+            report.evidence().clone(),
+        )
+        .unwrap();
+        let gc_report = crate::diagnostic::diagnose(input);
+        let claims = gc_report.automations()[0].claims();
+        assert!(matches!(
+            claims
+                .configuration()
+                .provenance()
+                .authority(AuthorityRole::AutomationMapping),
+            AuthorityResolution::Unresolved(_)
+        ));
+        assert!(matches!(
+            claims.schedule().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::ConsistencyNotAttested
+                )
+            )
+        ));
+        assert!(matches!(
+            claims.command().conclusion(),
+            crate::diagnostic::Conclusion::Known(crate::report::ObservationValue::Present)
+        ));
     }
 }
