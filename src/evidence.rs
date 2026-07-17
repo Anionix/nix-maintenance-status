@@ -1,6 +1,8 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::report::Schedule;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Provider {
@@ -334,6 +336,7 @@ pub struct ProviderEvidence {
     component: ObservationComponent,
     presence: Presence,
     occurrence: Option<DefinitionOccurrence>,
+    schedule: Option<Schedule>,
 }
 
 impl ProviderEvidence {
@@ -349,6 +352,7 @@ impl ProviderEvidence {
             component,
             presence,
             occurrence: None,
+            schedule: None,
         })
     }
 
@@ -403,6 +407,7 @@ impl ProviderEvidence {
             component,
             presence,
             occurrence: Some(occurrence),
+            schedule: None,
         })
     }
 
@@ -420,6 +425,19 @@ impl ProviderEvidence {
     }
     pub const fn occurrence(&self) -> Option<&DefinitionOccurrence> {
         self.occurrence.as_ref()
+    }
+    pub const fn schedule(&self) -> Option<&Schedule> {
+        self.schedule.as_ref()
+    }
+    pub fn with_schedule(mut self, schedule: Schedule) -> Result<Self, InputError> {
+        if self.component != ObservationComponent::Schedule
+            || self.provider != Provider::NixDarwinLaunchd
+            || self.presence != Presence::Present
+        {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        self.schedule = Some(schedule);
+        Ok(self)
     }
 }
 
@@ -486,7 +504,9 @@ impl ProviderEvidenceSet {
                 && pair[0].component == pair[1].component
                 && match (pair[0].occurrence.as_ref(), pair[1].occurrence.as_ref()) {
                     (Some(left), Some(right)) => {
-                        left == right && pair[0].presence == pair[1].presence
+                        left == right
+                            && pair[0].presence == pair[1].presence
+                            && pair[0].schedule == pair[1].schedule
                     }
                     _ => true,
                 }

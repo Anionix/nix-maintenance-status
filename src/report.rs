@@ -94,6 +94,120 @@ pub enum ObservationValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+pub enum LaunchdField<T> {
+    Any,
+    Exact(T),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LaunchdCalendarInterval {
+    minute: LaunchdField<u8>,
+    hour: LaunchdField<u8>,
+    day: LaunchdField<u8>,
+    month: LaunchdField<u8>,
+    weekday: LaunchdField<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ScheduleError {
+    Empty,
+    InvalidRange,
+    ZeroInterval,
+}
+
+impl LaunchdCalendarInterval {
+    pub fn new(
+        minute: LaunchdField<u8>,
+        hour: LaunchdField<u8>,
+        day: LaunchdField<u8>,
+        month: LaunchdField<u8>,
+        weekday: LaunchdField<u8>,
+    ) -> Result<Self, ScheduleError> {
+        let valid = |field, max| match field {
+            LaunchdField::Any => true,
+            LaunchdField::Exact(value) => value <= max,
+        };
+        if !valid(minute, 59)
+            || !valid(hour, 23)
+            || !valid(day, 31)
+            || !valid(month, 12)
+            || !valid(weekday, 7)
+        {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self {
+            minute,
+            hour,
+            day,
+            month,
+            weekday: match weekday {
+                LaunchdField::Exact(7) => LaunchdField::Exact(0),
+                other => other,
+            },
+        })
+    }
+    pub const fn minute(&self) -> LaunchdField<u8> {
+        self.minute
+    }
+    pub const fn hour(&self) -> LaunchdField<u8> {
+        self.hour
+    }
+    pub const fn day(&self) -> LaunchdField<u8> {
+        self.day
+    }
+    pub const fn month(&self) -> LaunchdField<u8> {
+        self.month
+    }
+    pub const fn weekday(&self) -> LaunchdField<u8> {
+        self.weekday
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LaunchdSchedule {
+    calendar: Vec<LaunchdCalendarInterval>,
+    interval_seconds: Option<u64>,
+    run_at_load: bool,
+}
+
+impl LaunchdSchedule {
+    pub fn new(
+        calendar: Vec<LaunchdCalendarInterval>,
+        interval_seconds: Option<u64>,
+        run_at_load: bool,
+    ) -> Result<Self, ScheduleError> {
+        if calendar.is_empty() && interval_seconds.is_none() && !run_at_load {
+            return Err(ScheduleError::Empty);
+        }
+        if interval_seconds == Some(0) {
+            return Err(ScheduleError::ZeroInterval);
+        }
+        Ok(Self {
+            calendar,
+            interval_seconds,
+            run_at_load,
+        })
+    }
+    pub fn calendar(&self) -> &[LaunchdCalendarInterval] {
+        &self.calendar
+    }
+    pub const fn interval_seconds(&self) -> Option<u64> {
+        self.interval_seconds
+    }
+    pub const fn run_at_load(&self) -> bool {
+        self.run_at_load
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Schedule {
+    Launchd(LaunchdSchedule),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum ConsistencyValue {
     Consistent,
     Inconsistent,
@@ -237,7 +351,7 @@ pub struct AutomationClaims {
     configuration: crate::diagnostic::Claim<ObservationValue>,
     runtime: crate::diagnostic::Claim<ObservationValue>,
     consistency: crate::diagnostic::Claim<ConsistencyValue>,
-    schedule: crate::diagnostic::Claim<ObservationValue>,
+    schedule: crate::diagnostic::Claim<Schedule>,
     command: crate::diagnostic::Claim<ObservationValue>,
     activity: crate::diagnostic::Claim<ObservationValue>,
     runs: crate::diagnostic::Claim<ObservationValue>,
@@ -255,18 +369,13 @@ macro_rules! claim_getters {
 }
 
 impl AutomationClaims {
-    claim_getters!(
-        configuration,
-        runtime,
-        schedule,
-        command,
-        activity,
-        runs,
-        last_result
-    );
+    claim_getters!(configuration, runtime, command, activity, runs, last_result);
 
     pub const fn consistency(&self) -> &crate::diagnostic::Claim<ConsistencyValue> {
         &self.consistency
+    }
+    pub const fn schedule(&self) -> &crate::diagnostic::Claim<Schedule> {
+        &self.schedule
     }
 
     pub(crate) fn from_entries(entries: &[&ProviderEvidence], ledger: &EvidenceLedger) -> Self {
@@ -281,7 +390,9 @@ impl AutomationClaims {
             consistency: crate::diagnostic::Claim::unknown(
                 crate::diagnostic::UnknownReason::DependentClaimUnknown,
             ),
-            schedule: unknown(),
+            schedule: crate::diagnostic::Claim::unknown(
+                crate::diagnostic::UnknownReason::DependentClaimUnknown,
+            ),
             command: unknown(),
             activity: unknown(),
             runs: unknown(),
@@ -317,28 +428,46 @@ impl AutomationClaims {
                     crate::diagnostic::UnknownReason::EvidenceUnavailable(
                         UnavailableReason::MalformedEvidence,
                     ),
-                    ids,
+                    ids.clone(),
                 )
             } else {
                 match first {
                     Presence::Absent => {
-                        crate::diagnostic::Claim::observed(ObservationValue::Absent, ids)
+                        crate::diagnostic::Claim::observed(ObservationValue::Absent, ids.clone())
                     }
-                    Presence::PresentEmpty => {
-                        crate::diagnostic::Claim::observed(ObservationValue::PresentEmpty, ids)
-                    }
+                    Presence::PresentEmpty => crate::diagnostic::Claim::observed(
+                        ObservationValue::PresentEmpty,
+                        ids.clone(),
+                    ),
                     Presence::Present => {
-                        crate::diagnostic::Claim::observed(ObservationValue::Present, ids)
+                        crate::diagnostic::Claim::observed(ObservationValue::Present, ids.clone())
                     }
                     Presence::Unavailable(reason) => {
-                        crate::diagnostic::Claim::unavailable(reason, ids)
+                        crate::diagnostic::Claim::unavailable(reason, ids.clone())
                     }
                 }
             };
             match component {
                 ObservationComponent::Configuration => claims.configuration = claim,
                 ObservationComponent::Runtime => claims.runtime = claim,
-                ObservationComponent::Schedule => claims.schedule = claim,
+                ObservationComponent::Schedule => {
+                    if let Some(schedule) = component_entries
+                        .iter()
+                        .filter_map(|entry| entry.schedule())
+                        .next()
+                    {
+                        claims.schedule = if conflict {
+                            crate::diagnostic::Claim::unknown_with_evidence(
+                                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                                    UnavailableReason::MalformedEvidence,
+                                ),
+                                ids,
+                            )
+                        } else {
+                            crate::diagnostic::Claim::observed(schedule.clone(), ids)
+                        };
+                    }
+                }
                 ObservationComponent::Command => claims.command = claim,
                 ObservationComponent::Activity => claims.activity = claim,
                 ObservationComponent::Runs => claims.runs = claim,
