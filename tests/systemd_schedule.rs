@@ -1,11 +1,11 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use nix_maintenance_status::{
-    CaptureSequence, Conclusion, DefinitionOccurrence, DiagnosticInput, ObservationComponent,
-    Presence, Provider, ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, ScanScope,
-    ScanWindow, Schedule, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject,
-    SystemdManagerIdentity, SystemdSchedule, SystemdTimerPolicy, SystemdTrigger, SystemdUnitId,
-    TargetPlatform,
+    CaptureSequence, Conclusion, DefinitionOccurrence, DiagnosticInput, InputError,
+    ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
+    ProviderLogicalKey, ScanScope, ScanWindow, Schedule, SourceOccurrenceKey, SourceRoot,
+    SourceRootId, Subject, SystemdManagerIdentity, SystemdSchedule, SystemdTimerPolicy,
+    SystemdTrigger, SystemdUnitId, TargetPlatform,
 };
 
 fn occurrence() -> DefinitionOccurrence {
@@ -22,12 +22,20 @@ fn occurrence() -> DefinitionOccurrence {
 
 #[test]
 fn systemd_schedule_preserves_calendar_and_monotonic_triggers() {
-    let policy = SystemdTimerPolicy::new(Some(60), Some(30), true, None, false, true, true);
+    let policy = SystemdTimerPolicy::new(
+        Some(Duration::from_secs(60)),
+        Some(Duration::from_secs(30)),
+        true,
+        None,
+        false,
+        true,
+        true,
+    );
     let schedule = Schedule::Systemd(
         SystemdSchedule::new(
             vec![
                 SystemdTrigger::OnCalendar("03:00:00".to_owned()),
-                SystemdTrigger::OnBootSec(300),
+                SystemdTrigger::OnBootSec(Duration::from_millis(300_500)),
             ],
             policy,
         )
@@ -66,6 +74,49 @@ fn systemd_schedule_rejects_empty_or_controlled_calendar() {
             vec![SystemdTrigger::OnCalendar("bad\nvalue".to_owned())],
             policy,
         )
+        .is_err()
+    );
+}
+
+#[test]
+fn schedule_attachment_is_single_use_and_present_only() {
+    let policy = SystemdTimerPolicy::new(None, None, false, None, false, false, false);
+    let schedule = Schedule::Systemd(
+        SystemdSchedule::new(
+            vec![SystemdTrigger::OnBootSec(Duration::from_secs(1))],
+            policy,
+        )
+        .unwrap(),
+    );
+    let row = ProviderEvidence::with_occurrence(
+        Provider::NixOsSystemd,
+        Subject::System,
+        ObservationComponent::Schedule,
+        Presence::Present,
+        occurrence(),
+    )
+    .unwrap()
+    .with_schedule(schedule.clone())
+    .unwrap();
+    assert_eq!(
+        row.with_schedule(schedule),
+        Err(InputError::DuplicateEvidenceKey)
+    );
+    assert!(
+        ProviderEvidence::new(
+            Provider::NixOsSystemd,
+            Subject::System,
+            ObservationComponent::Schedule,
+            Presence::Absent,
+        )
+        .unwrap()
+        .with_schedule(Schedule::Systemd(
+            SystemdSchedule::new(
+                vec![SystemdTrigger::OnBootSec(Duration::from_secs(1))],
+                policy
+            )
+            .unwrap(),
+        ))
         .is_err()
     );
 }
