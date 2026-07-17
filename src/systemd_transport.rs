@@ -14,33 +14,50 @@ pub const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 pub const SYSTEMD_PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 pub const SYSTEMD_TIMER_INTERFACE: &str = "org.freedesktop.systemd1.Timer";
 
-/// The transport accepts only the system bus or one caller-supplied UID bus.
+/// The transport accepts only the system bus or a validated current-user bus.
 /// It never consults session-bus environment variables or enumerates users.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemdBusScope {
     System,
-    CurrentUser { uid: u32 },
+    CurrentUser(CurrentUserUid),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurrentUserUid(u32);
 
 impl SystemdBusScope {
     pub const fn manager(self) -> SystemdManagerIdentity {
         match self {
             Self::System => SystemdManagerIdentity::System,
-            Self::CurrentUser { .. } => SystemdManagerIdentity::User,
+            Self::CurrentUser(_) => SystemdManagerIdentity::User,
         }
     }
 
     pub const fn subject(self) -> Subject {
         match self {
             Self::System => Subject::System,
-            Self::CurrentUser { uid } => Subject::Uid(uid),
+            Self::CurrentUser(CurrentUserUid(uid)) => Subject::Uid(uid),
         }
+    }
+
+    /// Create the only user-bus scope exposed to callers: the current
+    /// process UID. A caller cannot select another user's bus by construction.
+    #[cfg(target_os = "linux")]
+    pub fn current_user(uid: u32) -> Result<Self, SystemdTransportError> {
+        // SAFETY: geteuid has no preconditions and only reads process identity.
+        let process_uid = unsafe { libc::geteuid() };
+        if uid != process_uid {
+            return Err(SystemdTransportError::InvalidInput(
+                InputError::InvalidSubject,
+            ));
+        }
+        Ok(Self::CurrentUser(CurrentUserUid(uid)))
     }
 
     pub fn unix_address(self) -> String {
         match self {
             Self::System => "unix:path=/run/dbus/system_bus_socket".to_owned(),
-            Self::CurrentUser { uid } => format!("unix:path=/run/user/{uid}/bus"),
+            Self::CurrentUser(CurrentUserUid(uid)) => format!("unix:path=/run/user/{uid}/bus"),
         }
     }
 }
@@ -51,6 +68,27 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "GetUnit",
     "GetAll",
 ];
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+enum ReadOnlyMethod {
+    ListUnitFilesByPatterns,
+    ListUnitsByNames,
+    GetUnit,
+    GetAll,
+}
+
+#[cfg(target_os = "linux")]
+impl ReadOnlyMethod {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ListUnitFilesByPatterns => "ListUnitFilesByPatterns",
+            Self::ListUnitsByNames => "ListUnitsByNames",
+            Self::GetUnit => "GetUnit",
+            Self::GetAll => "GetAll",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -74,6 +112,10 @@ mod linux {
 
     use super::*;
     use crate::report::{SystemdTimerPolicy, SystemdTrigger};
+
+    const MAX_REPLY_BYTES: usize = 1_048_576;
+    const MAX_ROWS: usize = 128;
+    const MAX_TIMER_ENTRIES: usize = 128;
 
     #[derive(Debug, Clone)]
     pub struct SystemdBusTransport {
@@ -140,12 +182,12 @@ mod linux {
             match self.call::<_, Vec<(String, String)>>(
                 SYSTEMD_MANAGER_PATH,
                 SYSTEMD_MANAGER_INTERFACE,
-                "ListUnitFilesByPatterns",
+                ReadOnlyMethod::ListUnitFilesByPatterns,
                 &(Vec::<&str>::new(), vec![NIX_GC_TIMER]),
             ) {
-                Ok(files) => {
-                    normalize_nix_gc_state(Ok(files.iter().any(|(name, _)| name == NIX_GC_TIMER)))
-                }
+                Ok(files) => normalize_nix_gc_state(exact_row_presence(&files, |(name, _)| {
+                    name == NIX_GC_TIMER
+                })),
                 Err(error) => normalize_nix_gc_state(Err(error)),
             }
         }
@@ -154,10 +196,12 @@ mod linux {
             match self.call::<_, Vec<UnitRow>>(
                 SYSTEMD_MANAGER_PATH,
                 SYSTEMD_MANAGER_INTERFACE,
-                "ListUnitsByNames",
+                ReadOnlyMethod::ListUnitsByNames,
                 &(vec![NIX_GC_TIMER],),
             ) {
-                Ok(units) => normalize_nix_gc_state(Ok(!units.is_empty())),
+                Ok(units) => normalize_nix_gc_state(exact_row_presence(&units, |unit| {
+                    unit.0 == NIX_GC_TIMER
+                })),
                 Err(error) => normalize_nix_gc_state(Err(error)),
             }
         }
@@ -166,7 +210,7 @@ mod linux {
             self.call(
                 SYSTEMD_MANAGER_PATH,
                 SYSTEMD_MANAGER_INTERFACE,
-                "GetUnit",
+                ReadOnlyMethod::GetUnit,
                 &(unit,),
             )
         }
@@ -176,6 +220,9 @@ mod linux {
             path: &OwnedObjectPath,
         ) -> Result<SystemdTimerProperties, SystemdBusError> {
             let values = self.properties(path, SYSTEMD_TIMER_INTERFACE)?;
+            // LLM contract: pinned Timer fields normalize into typed triggers
+            // and policy; unknown bases, malformed variants, and oversized
+            // collections stay unavailable without exposing raw D-Bus data.
             let target = value::<String>(&values, "Unit")
                 .and_then(|value| {
                     crate::evidence::SystemdUnitId::new(&value)
@@ -183,13 +230,19 @@ mod linux {
                 })
                 .map_err(|_| SystemdBusError::InvalidSignature)?;
             let mut triggers = Vec::new();
-            for (name, usec, _) in value::<Vec<(String, u64, u64)>>(&values, "TimersMonotonic")? {
+            let monotonic = value::<Vec<(String, u64, u64)>>(&values, "TimersMonotonic")?;
+            if monotonic.len() > MAX_TIMER_ENTRIES {
+                return Err(SystemdBusError::ResourceLimitExceeded);
+            }
+            for (name, usec, _) in monotonic {
                 triggers.push(monotonic_trigger(&name, usec)?);
             }
-            for (base, expression, _) in
-                value::<Vec<(String, String, u64)>>(&values, "TimersCalendar")?
-            {
-                if !base.is_empty() {
+            let calendar = value::<Vec<(String, String, u64)>>(&values, "TimersCalendar")?;
+            if calendar.len() > MAX_TIMER_ENTRIES {
+                return Err(SystemdBusError::ResourceLimitExceeded);
+            }
+            for (base, expression, _) in calendar {
+                if base != "OnCalendar" {
                     return Err(SystemdBusError::InvalidSignature);
                 }
                 triggers.push(SystemdTrigger::OnCalendar(expression));
@@ -218,19 +271,29 @@ mod linux {
             path: &OwnedObjectPath,
             interface: &str,
         ) -> Result<HashMap<String, OwnedValue>, SystemdBusError> {
-            self.call(
+            // LLM contract: GetAll is read-only and its map is bounded before
+            // any named value is normalized; raw variants do not escape.
+            let values = self.call(
                 path.as_str(),
                 SYSTEMD_PROPERTIES_INTERFACE,
-                "GetAll",
+                ReadOnlyMethod::GetAll,
                 &(interface,),
-            )
+            )?;
+            if values.len() > MAX_ROWS {
+                Err(SystemdBusError::ResourceLimitExceeded)
+            } else {
+                Ok(values)
+            }
         }
 
+        // LLM contract: only ReadOnlyMethod values can reach the D-Bus call;
+        // replies are byte-bounded before typed deserialization and failures
+        // lose all raw payload text at the SystemdBusError boundary.
         fn call<B, T>(
             &self,
             path: &str,
             interface: &str,
-            method: &str,
+            method: ReadOnlyMethod,
             body: &B,
         ) -> Result<T, SystemdBusError>
         where
@@ -243,13 +306,15 @@ mod linux {
                     Some(SYSTEMD_DESTINATION),
                     path,
                     Some(interface),
-                    method,
+                    method.name(),
                     body,
                 )
                 .map_err(|error| map_zbus_error(&error))?;
-            reply
-                .body()
-                .deserialize()
+            let body = reply.body();
+            if body.len() > MAX_REPLY_BYTES {
+                return Err(SystemdBusError::ResourceLimitExceeded);
+            }
+            body.deserialize()
                 .map_err(|_| SystemdBusError::InvalidSignature)
         }
     }
@@ -267,6 +332,26 @@ mod linux {
         OwnedObjectPath,
     );
 
+    // LLM contract: an empty exact reply is Absent, one exact row is Present,
+    // and a non-empty reply without the requested identity is malformed.
+    pub(super) fn exact_row_presence<T, F>(rows: &[T], matches: F) -> Result<bool, SystemdBusError>
+    where
+        F: Fn(&T) -> bool,
+    {
+        if rows.len() > MAX_ROWS {
+            return Err(SystemdBusError::ResourceLimitExceeded);
+        }
+        if rows.is_empty() {
+            Ok(false)
+        } else if rows.iter().any(matches) {
+            Ok(true)
+        } else {
+            Err(SystemdBusError::InvalidSignature)
+        }
+    }
+
+    // LLM contract: only a named property with a bounded reply can become a
+    // typed value; missing, malformed, or oversized values never retain raw data.
     fn value<T>(values: &HashMap<String, OwnedValue>, name: &str) -> Result<T, SystemdBusError>
     where
         T: TryFrom<OwnedValue>,
@@ -279,6 +364,8 @@ mod linux {
         T::try_from(value).map_err(|_| SystemdBusError::InvalidSignature)
     }
 
+    // LLM contract: only the pinned systemd monotonic property names map to
+    // typed triggers; unknown names remain InvalidSignature.
     fn monotonic_trigger(name: &str, usec: u64) -> Result<SystemdTrigger, SystemdBusError> {
         let trigger = match name {
             "OnActiveUSec" => SystemdTrigger::OnActiveSec(duration(usec)),
@@ -295,6 +382,8 @@ mod linux {
         crate::systemd_adapter::duration_from_usec(usec)
     }
 
+    // LLM contract: transport errors become the finite typed taxonomy only;
+    // D-Bus names and descriptions never cross into report evidence.
     fn map_zbus_error(error: &zbus::Error) -> SystemdBusError {
         match error {
             zbus::Error::MethodError(name, _, _) => match name.as_str() {
@@ -334,11 +423,11 @@ mod tests {
             "unix:path=/run/dbus/system_bus_socket"
         );
         assert_eq!(
-            SystemdBusScope::CurrentUser { uid: 1000 }.unix_address(),
+            SystemdBusScope::CurrentUser(CurrentUserUid(1000)).unix_address(),
             "unix:path=/run/user/1000/bus"
         );
         assert!(
-            !SystemdBusScope::CurrentUser { uid: 1000 }
+            !SystemdBusScope::CurrentUser(CurrentUserUid(1000))
                 .unix_address()
                 .contains("tcp:")
         );
@@ -361,6 +450,23 @@ mod tests {
             !READ_ONLY_METHODS
                 .iter()
                 .any(|method| method.contains("Enable"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_unit_reply_boundary_rejects_wrong_rows() {
+        assert_eq!(
+            linux::exact_row_presence::<String, _>(&[], |_| true),
+            Ok(false)
+        );
+        assert_eq!(
+            linux::exact_row_presence(&["other.timer"], |unit| *unit == "nix-gc.timer"),
+            Err(SystemdBusError::InvalidSignature)
+        );
+        assert_eq!(
+            linux::exact_row_presence(&["nix-gc.timer"], |unit| *unit == "nix-gc.timer"),
+            Ok(true)
         );
     }
 }

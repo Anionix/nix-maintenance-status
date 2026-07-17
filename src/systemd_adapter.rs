@@ -24,6 +24,7 @@ pub enum SystemdBusError {
     NoReply,
     InvalidSignature,
     UnknownMethod,
+    ResourceLimitExceeded,
     OperationFailed,
 }
 
@@ -40,6 +41,9 @@ impl SystemdBusError {
             Self::NoReply => Presence::Unavailable(UnavailableReason::TimedOut),
             Self::InvalidSignature | Self::UnknownMethod => {
                 Presence::Unavailable(UnavailableReason::MalformedEvidence)
+            }
+            Self::ResourceLimitExceeded => {
+                Presence::Unavailable(UnavailableReason::ResourceLimitExceeded)
             }
             Self::ServiceUnknown | Self::NameHasNoOwner | Self::Disconnected => {
                 Presence::Unavailable(UnavailableReason::InterfaceUnavailable)
@@ -182,6 +186,10 @@ impl SystemdBusSnapshot {
     pub(crate) const fn generation_changed(&self) -> bool {
         matches!(self.generation, Some((before, after)) if before != after)
     }
+
+    pub(crate) const fn generation_attested(&self) -> bool {
+        self.generation.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,7 +266,7 @@ fn occurrence(snapshot: &SystemdBusSnapshot) -> DefinitionOccurrence {
 // NoSuchUnit is Absent only for the finite helper, all other bus failures stay
 // Unavailable, and no path performs I/O, retries, mutation, telemetry, or GC.
 // A transport without an official read-generation supplies no consistency
-// attestation; only an explicitly observed changed generation invalidates data.
+// attestation; it cannot create an identity or expose a schedule as usable.
 pub fn normalize_systemd_snapshot(
     snapshot: SystemdBusSnapshot,
     nixpkgs_revision: &str,
@@ -280,14 +288,17 @@ pub fn normalize_systemd_snapshot(
     let expected_service =
         SystemdUnitId::new("nix-gc.service").expect("catalogued Nix service identity is valid");
     let changed = snapshot.generation_changed();
+    let generation_attested = snapshot.generation_attested();
+    let unstable = changed || !generation_attested;
     let has_gc_identity = snapshot.manager == SystemdManagerIdentity::System
+        && generation_attested
         && snapshot.unit == expected_timer
         && matches!(
             snapshot.properties.as_ref(),
             Ok(Some(properties)) if properties.target() == &expected_service
         )
         && is_mapping;
-    let occurrence = (!changed && has_gc_identity).then(|| occurrence(&snapshot));
+    let occurrence = (!unstable && has_gc_identity).then(|| occurrence(&snapshot));
     let authority = if has_gc_identity {
         observed_authority
     } else if snapshot.manager == SystemdManagerIdentity::User {
@@ -325,9 +336,11 @@ pub fn normalize_systemd_snapshot(
             occurrence.as_ref(),
         )?,
     ];
-    if changed || runtime == Presence::Present || !matches!(&snapshot.properties, Ok(None)) {
+    if unstable || runtime == Presence::Present || !matches!(&snapshot.properties, Ok(None)) {
         let schedule_presence = if changed {
             Presence::Unavailable(UnavailableReason::ChangedDuringRead)
+        } else if !generation_attested {
+            Presence::Unavailable(UnavailableReason::ConsistencyNotAttested)
         } else {
             match &snapshot.properties {
                 Ok(Some(_)) => Presence::Present,
@@ -341,7 +354,7 @@ pub fn normalize_systemd_snapshot(
             snapshot.subject,
             occurrence.as_ref(),
         )?;
-        entries.push(if !changed {
+        entries.push(if !unstable {
             if let Ok(Some(properties)) = snapshot.properties {
                 if schedule_presence == Presence::Present {
                     evidence
@@ -417,5 +430,35 @@ mod tests {
             Ok(None),
         );
         assert_eq!(result, Err(InputError::InvalidSubject));
+    }
+
+    #[test]
+    fn missing_generation_keeps_systemd_identity_and_schedule_unknown() {
+        let snapshot = SystemdBusSnapshot::without_generation(
+            SystemdManagerIdentity::System,
+            Subject::System,
+            SystemdUnitId::new(NIX_GC_TIMER).unwrap(),
+            SourceRootId::new(7),
+            CaptureSequence::new(1),
+            Presence::Present,
+            Presence::Present,
+            Ok(None),
+        )
+        .unwrap();
+        let report =
+            normalize_systemd_snapshot(snapshot, "e8d924d50a462f89166e31a27bdcbbade35fd8e6")
+                .unwrap();
+        assert!(
+            report
+                .evidence()
+                .entries()
+                .iter()
+                .all(|entry| entry.occurrence().is_none())
+        );
+        assert!(report.evidence().entries().iter().any(|entry| {
+            entry.component() == ObservationComponent::Schedule
+                && entry.presence()
+                    == Presence::Unavailable(UnavailableReason::ConsistencyNotAttested)
+        }));
     }
 }

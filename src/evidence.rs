@@ -94,6 +94,7 @@ pub enum UnavailableReason {
     ChangedDuringRead,
     TimedOut,
     ResourceLimitExceeded,
+    ConsistencyNotAttested,
     ExternalIdentityMayBeRelevant,
 }
 
