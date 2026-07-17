@@ -481,7 +481,8 @@ impl AutomationClaims {
     }
 
     // LLM contract: normalized rows carry matching role results; disagreement
-    // is unresolved and missing schedule payload keeps evidence/provenance.
+    // is unresolved, and an unattested/changed Schedule blocks the Consistency
+    // transition while preserving independent Configuration and Runtime claims.
     pub(crate) fn from_entries(entries: &[&ProviderEvidence], ledger: &EvidenceLedger) -> Self {
         let unknown = || {
             crate::diagnostic::Claim::unknown(
@@ -581,7 +582,39 @@ impl AutomationClaims {
             crate::diagnostic::Conclusion::Known(value) => Some(value),
             crate::diagnostic::Conclusion::Unknown(_) => None,
         };
-        if let (Some(configuration), Some(runtime)) = (configuration, runtime) {
+        let consistency_attestation = match claims.schedule.conclusion() {
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    reason @ (UnavailableReason::ConsistencyNotAttested
+                    | UnavailableReason::ChangedDuringRead),
+                ),
+            ) => Some(*reason),
+            _ => None,
+        };
+        if let Some(reason) = consistency_attestation {
+            let ids = claims
+                .configuration
+                .provenance()
+                .evidence_ids()
+                .iter()
+                .chain(claims.runtime.provenance().evidence_ids())
+                .chain(claims.schedule.provenance().evidence_ids())
+                .cloned()
+                .collect();
+            let authorities = merge_claim_authorities(&[
+                claims.configuration.authorities(),
+                claims.runtime.authorities(),
+                claims.schedule.authorities(),
+            ]);
+            claims.consistency = crate::diagnostic::Claim::from_parts(
+                crate::diagnostic::Conclusion::Unknown(
+                    crate::diagnostic::UnknownReason::EvidenceUnavailable(reason),
+                ),
+                EvidenceClass::Unknown,
+                ids,
+                authorities,
+            );
+        } else if let (Some(configuration), Some(runtime)) = (configuration, runtime) {
             let ids = claims
                 .configuration
                 .provenance()
