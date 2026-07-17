@@ -1,8 +1,9 @@
 use nix_maintenance_status::{
-    CaptureSequence, DefinitionOccurrence, DiagnosticInput, InputError, LaunchdDomain,
-    LaunchdLabel, ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
-    ProviderLogicalKey, ScanScope, ScanWindow, SourceOccurrenceKey, SourceRoot, SourceRootId,
-    Subject, TargetPlatform, UnavailableReason,
+    CaptureSequence, DefinitionOccurrence, DiagnosticInput, InputError, LaunchdCalendarInterval,
+    LaunchdDomain, LaunchdLabel, LaunchdSchedule, ObservationComponent, Presence, Provider,
+    ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, ScanScope, ScanWindow, Schedule,
+    ScheduleError, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, TargetPlatform,
+    UnavailableReason,
 };
 
 const EXPECTED_JOB_HEADING: &str = "system/org.nixos.nix-gc = {";
@@ -66,6 +67,18 @@ pub(crate) fn plist_probe() -> Presence {
     )
 }
 
+#[allow(dead_code)] // consumed by the fixture seam until plist decoding is added
+// LLM contract: validated calendar/interval/load fields become one Launchd
+// Schedule; zero/empty schedules and out-of-range fields are rejected. The
+// normalizer retains no plist bytes, comments, paths, or control characters.
+pub(crate) fn normalize_launchd_schedule(
+    calendar: Vec<LaunchdCalendarInterval>,
+    interval_seconds: Option<u64>,
+    run_at_load: bool,
+) -> Result<Schedule, ScheduleError> {
+    LaunchdSchedule::new(calendar, interval_seconds, run_at_load).map(Schedule::Launchd)
+}
+
 fn launchd_occurrence() -> DefinitionOccurrence {
     DefinitionOccurrence::new(
         ProviderLogicalKey::Launchd {
@@ -111,9 +124,13 @@ pub(crate) fn diagnostic_input() -> Result<DiagnosticInput, InputError> {
 
 #[cfg(test)]
 mod tests {
-    use nix_maintenance_status::{Presence, UnavailableReason};
+    use nix_maintenance_status::{
+        LaunchdCalendarInterval, LaunchdField, Presence, Schedule, ScheduleError, UnavailableReason,
+    };
 
-    use super::{normalize_launchd, normalize_launchd_output, normalize_plist};
+    use super::{
+        normalize_launchd, normalize_launchd_output, normalize_launchd_schedule, normalize_plist,
+    };
 
     #[test]
     fn normalizes_launchd_outcomes_without_retaining_raw_output() {
@@ -143,6 +160,32 @@ mod tests {
         assert_eq!(
             normalize_plist(Err(failure)),
             Presence::Unavailable(UnavailableReason::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn normalizes_launchd_calendar_and_rejects_unsafe_schedule() {
+        let interval = LaunchdCalendarInterval::new(
+            LaunchdField::Exact(15),
+            LaunchdField::Exact(3),
+            LaunchdField::Any,
+            LaunchdField::Any,
+            LaunchdField::Exact(7),
+        )
+        .unwrap();
+        let schedule = normalize_launchd_schedule(vec![interval], None, false).unwrap();
+        let schedule = match schedule {
+            Schedule::Launchd(schedule) => schedule,
+            _ => unreachable!(),
+        };
+        assert_eq!(schedule.calendar()[0].weekday(), LaunchdField::Exact(0));
+        assert_eq!(
+            normalize_launchd_schedule(Vec::new(), None, false),
+            Err(ScheduleError::Empty)
+        );
+        assert_eq!(
+            normalize_launchd_schedule(Vec::new(), Some(0), false),
+            Err(ScheduleError::ZeroInterval)
         );
     }
 }
