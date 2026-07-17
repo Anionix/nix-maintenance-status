@@ -107,6 +107,8 @@ impl From<SystemdBusError> for SystemdTransportError {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
 
     use zbus::blocking::Connection;
     use zbus::zvariant::{OwnedObjectPath, OwnedValue};
@@ -285,6 +287,12 @@ mod linux {
             &self,
             path: &OwnedObjectPath,
         ) -> Result<SystemdCommandIdentity, SystemdBusError> {
+            let unit_values = self.properties(path, "org.freedesktop.systemd1.Unit")?;
+            if !effective_unit(&unit_values)? {
+                return Ok(SystemdCommandIdentity::unknown(
+                    crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
+                ));
+            }
             let values = self.properties(path, "org.freedesktop.systemd1.Service")?;
             let rows = value::<Vec<ServiceExecStartRow>>(&values, "ExecStart")?;
             let exec_start = normalize_service_exec_start(rows)?;
@@ -383,14 +391,42 @@ mod linux {
 
     fn read_wrapper(path: &str) -> Result<Vec<u8>, SystemdBusError> {
         const MAX_WRAPPER_BYTES: u64 = 65_536;
-        if !path.starts_with("/nix/store/") || !path.ends_with("-unit-script-nix-gc-start") {
+        if !path.starts_with("/nix/store/")
+            || !path.ends_with("-unit-script-nix-gc-start/bin/nix-gc-start")
+            || path.split('/').any(|component| component == "..")
+        {
             return Err(SystemdBusError::OperationFailed);
         }
-        let metadata = std::fs::metadata(path).map_err(|_| SystemdBusError::OperationFailed)?;
+        let canonical =
+            std::fs::canonicalize(path).map_err(|_| SystemdBusError::OperationFailed)?;
+        if canonical != std::path::Path::new(path) {
+            return Err(SystemdBusError::OperationFailed);
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| SystemdBusError::OperationFailed)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| SystemdBusError::OperationFailed)?;
         if !metadata.is_file() || metadata.len() > MAX_WRAPPER_BYTES {
             return Err(SystemdBusError::ResourceLimitExceeded);
         }
-        std::fs::read(path).map_err(|_| SystemdBusError::OperationFailed)
+        let mut bytes = Vec::new();
+        file.take(MAX_WRAPPER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SystemdBusError::OperationFailed)?;
+        if bytes.len() as u64 > MAX_WRAPPER_BYTES {
+            return Err(SystemdBusError::ResourceLimitExceeded);
+        }
+        Ok(bytes)
+    }
+
+    fn effective_unit(values: &HashMap<String, OwnedValue>) -> Result<bool, SystemdBusError> {
+        let fragment = value::<String>(values, "FragmentPath")?;
+        let dropins = value::<Vec<String>>(values, "DropInPaths")?;
+        Ok(!fragment.is_empty() && dropins.is_empty())
     }
 
     // LLM contract: an empty exact reply is Absent, one exact row is Present,
@@ -534,7 +570,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn service_exec_start_uses_only_the_documented_read_signature() {
-        let path = "/nix/store/abc-unit-script-nix-gc-start".to_owned();
+        let path = "/nix/store/abc-unit-script-nix-gc-start/bin/nix-gc-start".to_owned();
         let row = (path.clone(), vec![path], false, 0, 0, 0, 0, 0, 0, 0);
         assert!(linux::normalize_service_exec_start(vec![row]).is_ok());
         assert_eq!(
