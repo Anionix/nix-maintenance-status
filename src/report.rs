@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use crate::diagnostic::{DiagnosticInput, EvidenceClass};
 use crate::evidence::{
@@ -153,19 +156,57 @@ impl CoverageMatrix {
         }
     }
     pub(crate) fn from_evidence(evidence: &ProviderEvidenceSet) -> Self {
-        let leaves = evidence
+        const COMPONENTS: [ObservationComponent; 8] = [
+            ObservationComponent::Discovery,
+            ObservationComponent::Configuration,
+            ObservationComponent::Runtime,
+            ObservationComponent::Schedule,
+            ObservationComponent::Command,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ];
+        let coordinates: BTreeSet<_> = evidence
             .entries()
             .iter()
-            .map(|entry| CoverageLeaf {
-                provider: entry.provider(),
-                subject: entry.subject(),
-                component: entry.component(),
-                status: match entry.presence() {
-                    Presence::Unavailable(reason) => CoverageStatus::Unavailable(reason),
-                    Presence::Absent | Presence::PresentEmpty | Presence::Present => {
-                        CoverageStatus::Covered
+            .map(|entry| (entry.provider(), entry.subject()))
+            .collect();
+        let leaves = coordinates
+            .into_iter()
+            .flat_map(|(provider, subject)| {
+                COMPONENTS.into_iter().map(move |component| {
+                    let mut observed = false;
+                    let mut unavailable = None;
+                    for row in evidence.entries().iter().filter(|entry| {
+                        entry.provider() == provider
+                            && entry.subject() == subject
+                            && entry.component() == component
+                    }) {
+                        match row.presence() {
+                            Presence::Unavailable(reason) => unavailable = Some(reason),
+                            Presence::Absent | Presence::PresentEmpty | Presence::Present => {
+                                observed = true
+                            }
+                        }
                     }
-                },
+                    CoverageLeaf {
+                        provider,
+                        subject,
+                        component,
+                        status: unavailable.map_or_else(
+                            || {
+                                if observed {
+                                    CoverageStatus::Covered
+                                } else {
+                                    CoverageStatus::Unavailable(
+                                        UnavailableReason::InterfaceUnavailable,
+                                    )
+                                }
+                            },
+                            CoverageStatus::Unavailable,
+                        ),
+                    }
+                })
             })
             .collect::<Vec<_>>();
         let covered = leaves
@@ -245,21 +286,55 @@ impl AutomationClaims {
             runs: unknown(),
             last_result: unknown(),
         };
-        for entry in entries {
-            let ids = ledger.id_for(entry).map(|id| vec![id]).unwrap_or_default();
-            let claim = match entry.presence() {
-                Presence::Absent => {
-                    crate::diagnostic::Claim::observed(ObservationValue::Absent, ids)
+        for component in [
+            ObservationComponent::Configuration,
+            ObservationComponent::Runtime,
+            ObservationComponent::Schedule,
+            ObservationComponent::Command,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ] {
+            let component_entries: Vec<_> = entries
+                .iter()
+                .copied()
+                .filter(|entry| entry.component() == component)
+                .collect();
+            if component_entries.is_empty() {
+                continue;
+            }
+            let ids = component_entries
+                .iter()
+                .filter_map(|entry| ledger.id_for(entry))
+                .collect::<Vec<_>>();
+            let first = component_entries[0].presence();
+            let conflict = component_entries
+                .iter()
+                .any(|entry| entry.presence() != first);
+            let claim = if conflict {
+                crate::diagnostic::Claim::unknown_with_evidence(
+                    crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                        UnavailableReason::MalformedEvidence,
+                    ),
+                    ids,
+                )
+            } else {
+                match first {
+                    Presence::Absent => {
+                        crate::diagnostic::Claim::observed(ObservationValue::Absent, ids)
+                    }
+                    Presence::PresentEmpty => {
+                        crate::diagnostic::Claim::observed(ObservationValue::PresentEmpty, ids)
+                    }
+                    Presence::Present => {
+                        crate::diagnostic::Claim::observed(ObservationValue::Present, ids)
+                    }
+                    Presence::Unavailable(reason) => {
+                        crate::diagnostic::Claim::unavailable(reason, ids)
+                    }
                 }
-                Presence::PresentEmpty => {
-                    crate::diagnostic::Claim::observed(ObservationValue::PresentEmpty, ids)
-                }
-                Presence::Present => {
-                    crate::diagnostic::Claim::observed(ObservationValue::Present, ids)
-                }
-                Presence::Unavailable(reason) => crate::diagnostic::Claim::unavailable(reason, ids),
             };
-            match entry.component() {
+            match component {
                 ObservationComponent::Configuration => claims.configuration = claim,
                 ObservationComponent::Runtime => claims.runtime = claim,
                 ObservationComponent::Schedule => claims.schedule = claim,
@@ -267,7 +342,7 @@ impl AutomationClaims {
                 ObservationComponent::Activity => claims.activity = claim,
                 ObservationComponent::Runs => claims.runs = claim,
                 ObservationComponent::LastResult => claims.last_result = claim,
-                ObservationComponent::Discovery => {}
+                ObservationComponent::Discovery => unreachable!(),
             }
         }
         claims
@@ -337,11 +412,12 @@ impl EvidenceLedger {
     }
 }
 
-// LLM contract: generic Evidence is the sole trigger for inventory rows. Rows
-// are grouped only by the normalized provider/subject/occurrence key; each
-// Presence maps to Covered or a typed local Unavailable leaf, and Unknown
-// never becomes Absent. Sorting is canonical and this function performs no
-// I/O, network, mutation, telemetry, scheduler operation, or GC execution.
+// LLM contract: generic Evidence is the sole trigger for inventory rows. Only
+// rows with a validated provider occurrence become candidates; identity-free
+// rows remain ledger/Coverage evidence. Rows are grouped by the normalized
+// provider/subject/occurrence key; conflicting Presence values become local
+// Unknown. Sorting is canonical and this function performs no I/O, network,
+// mutation, telemetry, scheduler operation, or GC execution.
 pub(crate) fn build_inventory(
     evidence: &ProviderEvidenceSet,
     ledger: &EvidenceLedger,
@@ -354,7 +430,11 @@ pub(crate) fn build_inventory(
         ),
         Vec<&ProviderEvidence>,
     > = BTreeMap::new();
-    for entry in evidence.entries() {
+    for entry in evidence
+        .entries()
+        .iter()
+        .filter(|entry| entry.occurrence().is_some())
+    {
         groups
             .entry((
                 entry.provider(),

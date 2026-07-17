@@ -208,6 +208,17 @@ impl<T> Claim<T> {
             },
         }
     }
+
+    pub(crate) fn unknown_with_evidence(reason: UnknownReason, ids: Vec<EvidenceId>) -> Self {
+        Self {
+            conclusion: Conclusion::Unknown(reason),
+            provenance: Provenance {
+                class: EvidenceClass::Unknown,
+                evidence: ids,
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
