@@ -171,6 +171,105 @@ pub struct LaunchdSchedule {
     run_at_load: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SystemdTrigger {
+    OnCalendar(String),
+    OnActiveSec(u64),
+    OnBootSec(u64),
+    OnStartupSec(u64),
+    OnUnitActiveSec(u64),
+    OnUnitInactiveSec(u64),
+    OnClockChange,
+    OnTimezoneChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SystemdTimerPolicy {
+    accuracy_sec: Option<u64>,
+    randomized_delay_sec: Option<u64>,
+    fixed_random_delay: bool,
+    randomized_offset_sec: Option<u64>,
+    defer_reactivation: bool,
+    persistent: bool,
+    wake_system: bool,
+}
+
+impl SystemdTimerPolicy {
+    pub const fn new(
+        accuracy_sec: Option<u64>,
+        randomized_delay_sec: Option<u64>,
+        fixed_random_delay: bool,
+        randomized_offset_sec: Option<u64>,
+        defer_reactivation: bool,
+        persistent: bool,
+        wake_system: bool,
+    ) -> Self {
+        Self {
+            accuracy_sec,
+            randomized_delay_sec,
+            fixed_random_delay,
+            randomized_offset_sec,
+            defer_reactivation,
+            persistent,
+            wake_system,
+        }
+    }
+    pub const fn accuracy_sec(&self) -> Option<u64> {
+        self.accuracy_sec
+    }
+    pub const fn randomized_delay_sec(&self) -> Option<u64> {
+        self.randomized_delay_sec
+    }
+    pub const fn fixed_random_delay(&self) -> bool {
+        self.fixed_random_delay
+    }
+    pub const fn randomized_offset_sec(&self) -> Option<u64> {
+        self.randomized_offset_sec
+    }
+    pub const fn defer_reactivation(&self) -> bool {
+        self.defer_reactivation
+    }
+    pub const fn persistent(&self) -> bool {
+        self.persistent
+    }
+    pub const fn wake_system(&self) -> bool {
+        self.wake_system
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SystemdSchedule {
+    triggers: Vec<SystemdTrigger>,
+    policy: SystemdTimerPolicy,
+}
+
+impl SystemdSchedule {
+    pub fn new(
+        triggers: Vec<SystemdTrigger>,
+        policy: SystemdTimerPolicy,
+    ) -> Result<Self, ScheduleError> {
+        if triggers.is_empty() {
+            return Err(ScheduleError::Empty);
+        }
+        if triggers.iter().any(|trigger| {
+            matches!(trigger, SystemdTrigger::OnCalendar(expression)
+                if expression.is_empty()
+                    || expression.len() > 256
+                    || expression.chars().any(char::is_control))
+        }) {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self { triggers, policy })
+    }
+    pub fn triggers(&self) -> &[SystemdTrigger] {
+        &self.triggers
+    }
+    pub const fn policy(&self) -> &SystemdTimerPolicy {
+        &self.policy
+    }
+}
+
 impl LaunchdSchedule {
     pub fn new(
         calendar: Vec<LaunchdCalendarInterval>,
@@ -204,6 +303,7 @@ impl LaunchdSchedule {
 #[non_exhaustive]
 pub enum Schedule {
     Launchd(LaunchdSchedule),
+    Systemd(SystemdSchedule),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
