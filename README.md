@@ -117,7 +117,8 @@ cargo test --all-targets
 nix flake check
 ```
 
-The Rust crate currently has no third-party dependencies.
+The macOS path remains dependency-free. The Linux-only transport uses the
+version-pinned `zbus` adapter while its NixOS integration is still planned.
 
 ## Contributing and security
 

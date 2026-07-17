@@ -187,6 +187,7 @@ fn no_job_is_absent_but_bus_failures_are_unavailable() {
         SystemdBusError::NoReply,
         SystemdBusError::InvalidSignature,
         SystemdBusError::UnknownMethod,
+        SystemdBusError::ResourceLimitExceeded,
         SystemdBusError::ServiceUnknown,
         SystemdBusError::NameHasNoOwner,
         SystemdBusError::Disconnected,
