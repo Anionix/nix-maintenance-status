@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::catalog::{AuthorityResolution, AuthorityRole};
 use crate::report::Schedule;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -338,6 +339,7 @@ pub struct ProviderEvidence {
     presence: Presence,
     occurrence: Option<DefinitionOccurrence>,
     schedule: Option<Schedule>,
+    authorities: [AuthorityResolution; 3],
 }
 
 impl ProviderEvidence {
@@ -354,6 +356,7 @@ impl ProviderEvidence {
             presence,
             occurrence: None,
             schedule: None,
+            authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
 
@@ -409,6 +412,7 @@ impl ProviderEvidence {
             presence,
             occurrence: Some(occurrence),
             schedule: None,
+            authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
 
@@ -429,6 +433,43 @@ impl ProviderEvidence {
     }
     pub const fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
+    }
+    pub const fn authority(&self, role: AuthorityRole) -> AuthorityResolution {
+        self.authorities[role.index()]
+    }
+
+    // LLM contract: only an in-crate provider adapter may attach one catalog
+    // resolution to a normalized row. The requested role must match a
+    // Resolved reference; Unresolved/NotApplicable remain explicit, repeated
+    // non-empty slots are rejected, and no caller can mint authority or do I/O.
+    pub(crate) fn with_authority(
+        mut self,
+        role: AuthorityRole,
+        resolution: AuthorityResolution,
+    ) -> Result<Self, InputError> {
+        if !matches!(resolution, AuthorityResolution::NotClaimed)
+            && !component_accepts_authority(self.component, role)
+        {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        if let AuthorityResolution::Resolved(reference) = resolution
+            && (reference.role() != role
+                || matches!(reference.scope(), crate::catalog::CatalogScope::Provider(provider) if provider != self.provider))
+        {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        let index = role.index();
+        if !matches!(self.authorities[index], AuthorityResolution::NotClaimed) {
+            return Err(InputError::DuplicateEvidenceKey);
+        }
+        if !matches!(resolution, AuthorityResolution::NotClaimed) {
+            self.authorities[index] = resolution;
+        }
+        Ok(self)
+    }
+
+    pub(crate) const fn authorities(&self) -> &[AuthorityResolution; 3] {
+        &self.authorities
     }
     // LLM contract: this transition is valid only from a Present Schedule row
     // whose provider owns the matching provider-native Schedule variant. A
@@ -454,6 +495,25 @@ impl ProviderEvidence {
         self.schedule = Some(schedule);
         Ok(self)
     }
+}
+
+const fn component_accepts_authority(component: ObservationComponent, role: AuthorityRole) -> bool {
+    matches!(
+        (component, role),
+        (
+            ObservationComponent::Command,
+            AuthorityRole::GcOperationSemantics
+        ) | (
+            ObservationComponent::Configuration,
+            AuthorityRole::AutomationMapping
+        ) | (
+            ObservationComponent::Runtime,
+            AuthorityRole::SchedulerSemantics
+        ) | (
+            ObservationComponent::Schedule,
+            AuthorityRole::SchedulerSemantics
+        )
+    )
 }
 
 fn key_subject_matches_domain(key: &ProviderLogicalKey, subject: Subject) -> bool {
