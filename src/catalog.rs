@@ -266,12 +266,16 @@ impl SourceCitation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IntegrityPin {
     label: &'static str,
+    source: SourcePin,
     digest: &'static str,
 }
 
 impl IntegrityPin {
     pub const fn label(self) -> &'static str {
         self.label
+    }
+    pub const fn source(self) -> SourcePin {
+        self.source
     }
     pub const fn digest(self) -> &'static str {
         self.digest
@@ -579,11 +583,12 @@ fn validate_catalog(entries: &[AuthorityRef]) -> Result<(), CatalogError> {
         if !valid_scope {
             return Err(CatalogError::InvalidRoleScope);
         }
-        if entry
-            .integrity
-            .iter()
-            .any(|pin| !valid_text(pin.label) || !valid_digest(pin.digest))
-        {
+        if entry.integrity.iter().any(|pin| {
+            !valid_text(pin.label)
+                || !valid_digest(pin.digest)
+                || !valid_identity_text(pin.source.repository)
+                || !valid_revision_text(pin.source.revision.0)
+        }) {
             return Err(CatalogError::InvalidIdentity);
         }
         if entry.lifecycle.replacement.is_some_and(|replacement| {
@@ -723,6 +728,31 @@ const fn source(
     fingerprint: Option<&'static str>,
     citations: &'static [SourceCitation],
 ) -> AuthorityRef {
+    source_with_integrity(
+        entry_id,
+        family_id,
+        scope,
+        role,
+        repository,
+        revision,
+        fingerprint,
+        citations,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn source_with_integrity(
+    entry_id: &'static str,
+    family_id: &'static str,
+    scope: CatalogScope,
+    role: AuthorityRole,
+    repository: &'static str,
+    revision: &'static str,
+    fingerprint: Option<&'static str>,
+    citations: &'static [SourceCitation],
+    integrity: &'static [IntegrityPin],
+) -> AuthorityRef {
     AuthorityRef {
         entry_id: CatalogEntryId(entry_id),
         family_id: CatalogFamilyId(family_id),
@@ -734,7 +764,7 @@ const fn source(
         }),
         fingerprint,
         citations,
-        integrity: &[],
+        integrity,
         lifecycle: Lifecycle {
             state: LifecycleState::Active,
             first_audited_on: "2026-07-17",
@@ -842,6 +872,10 @@ const SYSTEMD_CITATIONS: &[SourceCitation] = &[
         url: "https://github.com/systemd/systemd/blob/de9dbc37ad4aa637e200ac02a0545095997055df/man/systemd.time.xml",
     },
 ];
+const SYSTEMD_DBUS_CITATIONS: &[SourceCitation] = &[SourceCitation {
+    title: "systemd D-Bus manager and service contract",
+    url: "https://github.com/systemd/systemd/blob/de9dbc37ad4aa637e200ac02a0545095997055df/man/org.freedesktop.systemd1.xml",
+}];
 const SYSTEMD_262_CITATIONS: &[SourceCitation] = &[
     SourceCitation {
         title: "systemd timer contract",
@@ -881,7 +915,26 @@ const FCRON_341_CITATIONS: &[SourceCitation] = &[
     },
 ];
 
-const CATALOG: [AuthorityRef; 10] = [
+const NIXOS_INTEGRITY: &[IntegrityPin] = &[
+    IntegrityPin {
+        label: "systemd-261-package-source",
+        source: SourcePin {
+            repository: "NixOS/nixpkgs",
+            revision: FullRevision("6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee"),
+        },
+        digest: "e8807564442a4348a6a7006109a2d900480c56454553ad490d5946a2dc4dcc64",
+    },
+    IntegrityPin {
+        label: "nixpkgs-package-and-compatibility-patches",
+        source: SourcePin {
+            repository: "NixOS/nixpkgs",
+            revision: FullRevision("6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee"),
+        },
+        digest: "16689e241f3f394bcdc5b91ba22efe2067c8b925d8de717f859426f240f4af9d",
+    },
+];
+
+const CATALOG: [AuthorityRef; 11] = [
     source(
         "nix.gc.operation.v1",
         "nix.gc.operation.v1",
@@ -902,7 +955,7 @@ const CATALOG: [AuthorityRef; 10] = [
         Some("nix-darwin-gc-launchd-mapping-v1"),
         DARWIN_CITATIONS,
     ),
-    source(
+    source_with_integrity(
         "nixos.gc.mapping.v1",
         "nixos.gc.mapping.v1",
         CatalogScope::Provider(Provider::NixOsSystemd),
@@ -911,6 +964,7 @@ const CATALOG: [AuthorityRef; 10] = [
         "e8d924d50a462f89166e31a27bdcbbade35fd8e6",
         Some("nixos-gc-systemd-mapping-v1"),
         NIXOS_CITATIONS,
+        NIXOS_INTEGRITY,
     ),
     contract(
         "launchd.macos-27.scheduler.v1",
@@ -950,6 +1004,19 @@ const CATALOG: [AuthorityRef; 10] = [
         None,
         Some("systemd-v262-devel-v1"),
         SYSTEMD_262_CITATIONS,
+    ),
+    contract(
+        "systemd.v261.dbus.v1",
+        "systemd.v261.dbus.v1",
+        CatalogScope::Provider(Provider::NixOsSystemd),
+        AuthorityRole::SchedulerSemantics,
+        "systemd",
+        "de9dbc37ad4aa637e200ac02a0545095997055df",
+        "org.freedesktop.systemd1.xml",
+        Some("261"),
+        None,
+        Some("systemd-v261-dbus-v1"),
+        SYSTEMD_DBUS_CITATIONS,
     ),
     contract(
         "cronie.v1.scheduler.v1",
@@ -1011,7 +1078,7 @@ mod tests {
 
     #[test]
     fn embedded_catalog_is_exact_and_offline_valid() {
-        assert_eq!(CATALOG.len(), 10);
+        assert_eq!(CATALOG.len(), 11);
         assert!(catalog_check().is_ok());
         let darwin = CATALOG[1];
         assert_eq!(darwin.family_id().as_str(), "nix-darwin.gc.mapping.v1");
@@ -1022,6 +1089,20 @@ mod tests {
         assert_eq!(darwin.citations().len(), 2);
         assert_eq!(darwin.lifecycle().state(), LifecycleState::Active);
         assert_eq!(darwin.lifecycle().first_audited_on(), "2026-07-17");
+        let nixos = CATALOG[2];
+        assert_eq!(nixos.integrity().len(), 2);
+        assert_eq!(
+            nixos.integrity()[0].source().revision().as_str(),
+            "6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee"
+        );
+        let dbus = CATALOG
+            .iter()
+            .find(|entry| entry.entry_id().as_str() == "systemd.v261.dbus.v1")
+            .expect("pinned D-Bus contract");
+        assert!(matches!(
+            dbus.pin(),
+            AuthorityPin::Contract(pin) if pin.contract() == "org.freedesktop.systemd1.xml"
+        ));
         const WRONG_OWNER: &[SourceCitation] = &[SourceCitation {
             title: "wrong owner",
             url: "https://github.com/evil/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/source",
@@ -1284,6 +1365,10 @@ mod tests {
         let mut entry = CATALOG[0];
         const INVALID: &[IntegrityPin] = &[IntegrityPin {
             label: "package",
+            source: SourcePin {
+                repository: "NixOS/nixpkgs",
+                revision: FullRevision("e8d924d50a462f89166e31a27bdcbbade35fd8e6"),
+            },
             digest: "not-a-digest",
         }];
         entry.integrity = INVALID;

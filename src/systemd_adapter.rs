@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 
 use crate::catalog::{
@@ -12,6 +13,148 @@ use crate::evidence::{
 use crate::report::{Schedule, SystemdSchedule, SystemdTimerPolicy, SystemdTrigger};
 
 pub const NIX_GC_TIMER: &str = "nix-gc.timer";
+pub const NIX_GC_SERVICE: &str = "nix-gc.service";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SystemdCommandUnknownReason {
+    MalformedExecStart,
+    WrapperUnavailable,
+    WrapperMismatch,
+    NonUtf8,
+    AmbiguousShell,
+    OverrideDetected,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SystemdExecStart {
+    executable: String,
+}
+
+impl fmt::Debug for SystemdExecStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque>")
+    }
+}
+
+impl SystemdExecStart {
+    /// Normalize the exact systemd `ExecStart` read signature
+    /// `a(sasbttttuii)`. The raw path/argv remain adapter-local and Debug never
+    /// exposes them.
+    pub fn from_read_signature(
+        executable: &str,
+        argv: &[String],
+        ignore_failure: bool,
+    ) -> Result<Self, SystemdCommandUnknownReason> {
+        if ignore_failure
+            || executable.is_empty()
+            || argv.len() != 1
+            || argv.first().is_none_or(|value| value != executable)
+            || executable.chars().any(char::is_control)
+            || argv[0].len() > 1024
+            || argv[0].chars().any(char::is_control)
+        {
+            return Err(SystemdCommandUnknownReason::MalformedExecStart);
+        }
+        Ok(Self {
+            executable: executable.to_owned(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn executable(&self) -> &str {
+        &self.executable
+    }
+
+    fn is_generated_wrapper(&self) -> bool {
+        self.executable.starts_with("/nix/store/")
+            && self.executable.ends_with("-unit-script-nix-gc-start")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SystemdCommandIdentity {
+    NixCollectGarbage,
+    Unknown(SystemdCommandUnknownReason),
+}
+
+impl SystemdCommandIdentity {
+    pub const fn exact() -> Self {
+        Self::NixCollectGarbage
+    }
+
+    pub const fn unknown(reason: SystemdCommandUnknownReason) -> Self {
+        Self::Unknown(reason)
+    }
+
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::NixCollectGarbage)
+    }
+
+    // LLM contract: Exact is Present; every non-exact identity is Unknown and
+    // maps only to unavailable evidence, never to Absent.
+    pub const fn presence(self) -> Presence {
+        match self {
+            Self::NixCollectGarbage => Presence::Present,
+            Self::Unknown(_) => Presence::Unavailable(UnavailableReason::MalformedEvidence),
+        }
+    }
+}
+
+// LLM contract: one generated wrapper plus one safe `exec` command is exact;
+// overrides, shell syntax, malformed bytes, and unavailable wrappers remain
+// Unknown. Raw command text never crosses the evidence boundary.
+pub fn classify_nix_gc_command(
+    exec_start: &SystemdExecStart,
+    wrapper: Result<&[u8], SystemdBusError>,
+) -> SystemdCommandIdentity {
+    if !exec_start.is_generated_wrapper() {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::OverrideDetected);
+    }
+    let bytes = match wrapper {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return SystemdCommandIdentity::unknown(
+                SystemdCommandUnknownReason::WrapperUnavailable,
+            );
+        }
+    };
+    let script = match std::str::from_utf8(bytes) {
+        Ok(script) => script.strip_suffix('\n').unwrap_or(script),
+        Err(_) => return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::NonUtf8),
+    };
+    if script.is_empty() || script.ends_with('\n') || script.contains('\r') {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
+    }
+    let lines: Vec<_> = script.lines().collect();
+    let command_line = match lines.as_slice() {
+        [shebang, command] if shebang.starts_with("#!/") => *command,
+        _ => "",
+    };
+    if !command_line.starts_with("exec ") {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
+    }
+    let mut words = command_line[5..].split_whitespace();
+    let Some(command) = words.next() else {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
+    };
+    if !command.starts_with("/nix/store/") || !command.ends_with("/bin/nix-collect-garbage") {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
+    }
+    if words.any(|word| !safe_gc_option(word)) {
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::AmbiguousShell);
+    }
+    SystemdCommandIdentity::NixCollectGarbage
+}
+
+fn safe_gc_option(value: &str) -> bool {
+    !value.is_empty()
+        && value.starts_with('-')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'=' | b'_' | b'+' | b'-')
+        })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -101,6 +244,7 @@ pub struct SystemdBusSnapshot {
     loaded: Presence,
     generation: Option<(u64, u64)>,
     properties: Result<Option<SystemdTimerProperties>, SystemdBusError>,
+    command: Result<Option<SystemdCommandIdentity>, SystemdBusError>,
 }
 
 impl SystemdBusSnapshot {
@@ -180,7 +324,18 @@ impl SystemdBusSnapshot {
             loaded,
             generation,
             properties,
+            command: Ok(None),
         })
+    }
+
+    // LLM contract: attach one adapter-normalized command result; replacing
+    // it never performs I/O or upgrades Unknown into an exact identity.
+    pub fn with_command(
+        mut self,
+        command: Result<Option<SystemdCommandIdentity>, SystemdBusError>,
+    ) -> Self {
+        self.command = command;
+        self
     }
 
     pub(crate) const fn generation_changed(&self) -> bool {
@@ -286,7 +441,7 @@ pub fn normalize_systemd_snapshot(
     let expected_timer =
         SystemdUnitId::new(NIX_GC_TIMER).expect("catalogued Nix timer identity is valid");
     let expected_service =
-        SystemdUnitId::new("nix-gc.service").expect("catalogued Nix service identity is valid");
+        SystemdUnitId::new(NIX_GC_SERVICE).expect("catalogued Nix service identity is valid");
     let changed = snapshot.generation_changed();
     let generation_attested = snapshot.generation_attested();
     let unstable = changed || !generation_attested;
@@ -296,6 +451,10 @@ pub fn normalize_systemd_snapshot(
         && matches!(
             snapshot.properties.as_ref(),
             Ok(Some(properties)) if properties.target() == &expected_service
+        )
+        && matches!(
+            snapshot.command,
+            Ok(Some(command)) if command.is_exact()
         )
         && is_mapping;
     let occurrence = (!unstable && has_gc_identity).then(|| occurrence(&snapshot));
@@ -336,6 +495,19 @@ pub fn normalize_systemd_snapshot(
             occurrence.as_ref(),
         )?,
     ];
+    if snapshot.manager == SystemdManagerIdentity::System {
+        let command_presence = match snapshot.command {
+            Ok(Some(command)) => command.presence(),
+            Ok(None) => Presence::Unavailable(UnavailableReason::MalformedEvidence),
+            Err(error) => error.presence(),
+        };
+        entries.push(make_evidence(
+            ObservationComponent::Command,
+            command_presence,
+            snapshot.subject,
+            occurrence.as_ref(),
+        )?);
+    }
     if unstable || runtime == Presence::Present || !matches!(&snapshot.properties, Ok(None)) {
         let schedule_presence = if changed {
             Presence::Unavailable(UnavailableReason::ChangedDuringRead)
@@ -412,6 +584,51 @@ pub const fn duration_from_usec(usec: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generated_exec() -> SystemdExecStart {
+        let path = "/nix/store/abc-unit-script-nix-gc-start".to_owned();
+        SystemdExecStart::from_read_signature(&path, std::slice::from_ref(&path), false).unwrap()
+    }
+
+    #[test]
+    fn generated_wrapper_is_the_only_exact_command_identity() {
+        let exec = generated_exec();
+        assert_eq!(
+            classify_nix_gc_command(
+                &exec,
+                Ok(b"#!/bin/sh\nexec /nix/store/nix/bin/nix-collect-garbage --delete-old\n"),
+            ),
+            SystemdCommandIdentity::NixCollectGarbage
+        );
+        assert!(matches!(
+            classify_nix_gc_command(
+                &exec,
+                Ok(b"#!/bin/sh\nexec /bin/sh -c nix-collect-garbage\n")
+            ),
+            SystemdCommandIdentity::Unknown(SystemdCommandUnknownReason::WrapperMismatch)
+        ));
+        assert!(matches!(
+            classify_nix_gc_command(
+                &exec,
+                Ok(b"#!/bin/sh\nexec /nix/store/nix/bin/nix-collect-garbage $(secret)\n")
+            ),
+            SystemdCommandIdentity::Unknown(SystemdCommandUnknownReason::AmbiguousShell)
+        ));
+    }
+
+    #[test]
+    fn malformed_or_unavailable_wrappers_never_leak_raw_data() {
+        let exec = generated_exec();
+        assert!(matches!(
+            classify_nix_gc_command(&exec, Ok(&[0xffu8][..])),
+            SystemdCommandIdentity::Unknown(SystemdCommandUnknownReason::NonUtf8)
+        ));
+        assert!(matches!(
+            classify_nix_gc_command(&exec, Err(SystemdBusError::OperationFailed)),
+            SystemdCommandIdentity::Unknown(SystemdCommandUnknownReason::WrapperUnavailable)
+        ));
+        assert!(!format!("{exec:?}").contains("nix-gc-start"));
+    }
 
     #[test]
     fn unresolved_subjects_are_rejected_at_the_systemd_boundary() {

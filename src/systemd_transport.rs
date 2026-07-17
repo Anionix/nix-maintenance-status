@@ -5,7 +5,8 @@ use crate::systemd_adapter::SystemdBusError;
 use crate::evidence::{CaptureSequence, Presence, SourceRootId};
 #[cfg(target_os = "linux")]
 use crate::systemd_adapter::{
-    NIX_GC_TIMER, SystemdBusSnapshot, SystemdTimerProperties, normalize_nix_gc_state,
+    NIX_GC_SERVICE, NIX_GC_TIMER, SystemdBusSnapshot, SystemdCommandIdentity, SystemdExecStart,
+    SystemdTimerProperties, classify_nix_gc_command, normalize_nix_gc_state,
 };
 
 pub const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
@@ -162,6 +163,19 @@ mod linux {
             } else {
                 Ok(None)
             };
+            let expected_service = crate::evidence::SystemdUnitId::new(NIX_GC_SERVICE)
+                .map_err(SystemdTransportError::InvalidInput)?;
+            let command = match &properties {
+                Ok(Some(properties)) if properties.target() == &expected_service => self
+                    .unit_path(NIX_GC_SERVICE)
+                    .and_then(|path| self.service_command(&path))
+                    .map(Some),
+                Ok(Some(_)) => Ok(Some(SystemdCommandIdentity::unknown(
+                    crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
+                ))),
+                Ok(None) => Ok(None),
+                Err(_) => Ok(None),
+            };
             // systemd v261 exposes no Manager.Generation property. Keep that
             // absence explicit instead of fabricating a race-free sequence.
             SystemdBusSnapshot::without_generation(
@@ -175,6 +189,7 @@ mod linux {
                 loaded,
                 properties,
             )
+            .map(|snapshot| snapshot.with_command(command))
             .map_err(SystemdTransportError::InvalidInput)
         }
 
@@ -266,6 +281,21 @@ mod linux {
                 .map_err(|_| SystemdBusError::InvalidSignature)
         }
 
+        fn service_command(
+            &self,
+            path: &OwnedObjectPath,
+        ) -> Result<SystemdCommandIdentity, SystemdBusError> {
+            let values = self.properties(path, "org.freedesktop.systemd1.Service")?;
+            let rows = value::<Vec<ServiceExecStartRow>>(&values, "ExecStart")?;
+            let exec_start = normalize_service_exec_start(rows)?;
+            let wrapper = read_wrapper(exec_start.executable());
+            let wrapper = wrapper
+                .as_ref()
+                .map(|bytes| bytes.as_slice())
+                .map_err(|error| *error);
+            Ok(classify_nix_gc_command(&exec_start, wrapper))
+        }
+
         fn properties(
             &self,
             path: &OwnedObjectPath,
@@ -331,6 +361,37 @@ mod linux {
         String,
         OwnedObjectPath,
     );
+
+    type ServiceExecStartRow = (String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i32);
+
+    // LLM contract: exactly one typed read-signature row is required for the
+    // generated service. The write signature, duplicate rows, malformed text,
+    // and raw variants never cross this boundary.
+    fn normalize_service_exec_start(
+        rows: Vec<ServiceExecStartRow>,
+    ) -> Result<SystemdExecStart, SystemdBusError> {
+        if rows.len() != 1 {
+            return Err(SystemdBusError::InvalidSignature);
+        }
+        let (executable, argv, ignore_failure, _, _, _, _, _, _, _) = rows
+            .into_iter()
+            .next()
+            .ok_or(SystemdBusError::InvalidSignature)?;
+        SystemdExecStart::from_read_signature(&executable, &argv, ignore_failure)
+            .map_err(|_| SystemdBusError::InvalidSignature)
+    }
+
+    fn read_wrapper(path: &str) -> Result<Vec<u8>, SystemdBusError> {
+        const MAX_WRAPPER_BYTES: u64 = 65_536;
+        if !path.starts_with("/nix/store/") || !path.ends_with("-unit-script-nix-gc-start") {
+            return Err(SystemdBusError::OperationFailed);
+        }
+        let metadata = std::fs::metadata(path).map_err(|_| SystemdBusError::OperationFailed)?;
+        if !metadata.is_file() || metadata.len() > MAX_WRAPPER_BYTES {
+            return Err(SystemdBusError::ResourceLimitExceeded);
+        }
+        std::fs::read(path).map_err(|_| SystemdBusError::OperationFailed)
+    }
 
     // LLM contract: an empty exact reply is Absent, one exact row is Present,
     // and a non-empty reply without the requested identity is malformed.
@@ -467,6 +528,18 @@ mod tests {
         assert_eq!(
             linux::exact_row_presence(&["nix-gc.timer"], |unit| *unit == "nix-gc.timer"),
             Ok(true)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_exec_start_uses_only_the_documented_read_signature() {
+        let path = "/nix/store/abc-unit-script-nix-gc-start".to_owned();
+        let row = (path.clone(), vec![path], false, 0, 0, 0, 0, 0, 0, 0);
+        assert!(linux::normalize_service_exec_start(vec![row]).is_ok());
+        assert_eq!(
+            linux::normalize_service_exec_start(Vec::new()),
+            Err(SystemdBusError::InvalidSignature)
         );
     }
 }

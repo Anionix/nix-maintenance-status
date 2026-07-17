@@ -69,6 +69,9 @@ fn snapshot_with_config(
         properties,
     )
     .unwrap()
+    .with_command(Ok(Some(
+        nix_maintenance_status::SystemdCommandIdentity::exact(),
+    )))
 }
 
 const REVISION: &str = "e8d924d50a462f89166e31a27bdcbbade35fd8e6";
@@ -90,7 +93,7 @@ fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
         report.authority(),
         AuthorityResolution::Resolved(_)
     ));
-    assert_eq!(report.evidence().entries().len(), 3);
+    assert_eq!(report.evidence().entries().len(), 4);
     assert!(
         report
             .evidence()
@@ -173,6 +176,25 @@ fn configuration_and_runtime_remain_independent() {
             .presence(),
         Presence::Unavailable(UnavailableReason::PermissionDenied)
     );
+}
+
+#[test]
+fn command_unknown_does_not_erase_schedule() {
+    let report = normalize_systemd_snapshot(
+        snapshot(
+            SystemdManagerIdentity::System,
+            "nix-gc.timer",
+            Presence::Present,
+            3,
+            Ok(Some(properties("nix-gc.service"))),
+        )
+        .with_command(Err(SystemdBusError::AccessDenied)),
+        REVISION,
+    )
+    .unwrap();
+    assert!(report.evidence().entries().iter().any(|entry| {
+        entry.component() == ObservationComponent::Schedule && entry.presence() == Presence::Present
+    }));
 }
 
 #[test]
