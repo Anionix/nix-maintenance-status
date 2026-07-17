@@ -381,6 +381,16 @@ mod linux {
                 ReadOnlyMethod::GetAll,
                 &(interface,),
             )?;
+            println!(
+                "temporary systemd probe: property_count={} interface_known={}",
+                values.len(),
+                matches!(
+                    interface,
+                    "org.freedesktop.systemd1.Unit"
+                        | "org.freedesktop.systemd1.Service"
+                        | SYSTEMD_TIMER_INTERFACE
+                )
+            );
             if values.len() > MAX_PROPERTY_ROWS {
                 Err(SystemdBusError::ResourceLimitExceeded)
             } else {
