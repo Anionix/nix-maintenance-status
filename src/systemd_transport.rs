@@ -477,7 +477,7 @@ mod linux {
             && path.ends_with("/nix-gc.service")
             && object
                 .split_once('-')
-                .is_some_and(|(_, name)| name.starts_with("unit-"))
+                .is_some_and(|(_, name)| name.starts_with("unit-") || name == "system-units")
     }
 
     // LLM contract: an empty exact reply is Absent, one exact row is Present,

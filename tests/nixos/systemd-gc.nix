@@ -65,9 +65,6 @@ in
         options = "--delete-old";
       };
 
-      # The boundary fixture deliberately replaces the command while keeping
-      # the timer shape. A production adapter must report command Unknown for
-      # this administrative override rather than attributing it to Nix.
       systemd.services.nix-gc = if official then { } else {
         script = lib.mkForce "exec ${pkgs.coreutils}/bin/true";
       };
@@ -120,7 +117,7 @@ in
     machine.wait_for_unit("user@1000.service")
     machine.succeed("test -S /run/user/1000/bus")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
-    machine.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\" | grep -E '^scope=system command=present observations=[0-9]+$' || { echo \"$output\" >&2; exit 1; }")
+    machine.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system command=present observations=4'")
     machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user command=not-applicable observations=3'")
     machine.fail("test -S /run/user/1001/bus")
     machine.succeed("test \"$(systemctl show nix-gc.service -p ActiveState --value)\" = inactive")
