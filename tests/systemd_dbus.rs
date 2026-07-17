@@ -151,6 +151,28 @@ fn configuration_and_runtime_remain_independent() {
             );
         }
     }
+
+    let failed_properties = normalize_systemd_snapshot(
+        snapshot(
+            SystemdManagerIdentity::System,
+            "nix-gc.timer",
+            Presence::Absent,
+            3,
+            Err(SystemdBusError::AccessDenied),
+        ),
+        REVISION,
+    )
+    .unwrap();
+    assert_eq!(
+        failed_properties
+            .evidence()
+            .entries()
+            .iter()
+            .find(|entry| entry.component() == ObservationComponent::Schedule)
+            .unwrap()
+            .presence(),
+        Presence::Unavailable(UnavailableReason::PermissionDenied)
+    );
 }
 
 #[test]
