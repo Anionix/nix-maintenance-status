@@ -300,7 +300,7 @@ mod linux {
             let rows = value::<Vec<ServiceExecStartRow>>(&values, "ExecStart")?;
             let exec_start = normalize_service_exec_start(rows)?;
             let wrapper = read_wrapper(exec_start.executable());
-            eprintln!(
+            println!(
                 "temporary systemd probe: wrapper_read={} bytes={}",
                 wrapper.is_ok(),
                 wrapper.as_ref().map_or(0, Vec::len)
@@ -310,7 +310,7 @@ mod linux {
                 .map(|bytes| bytes.as_slice())
                 .map_err(|error| *error);
             let identity = classify_nix_gc_command(&exec_start, wrapper);
-            eprintln!(
+            println!(
                 "temporary systemd probe: command_exact={}",
                 identity.is_exact()
             );
