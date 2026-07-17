@@ -104,11 +104,14 @@ pub enum AuthorityPin {
 /// Adapter-owned identity observation. It can select an embedded Authority,
 /// but it cannot create or extend one.
 #[derive(Clone, PartialEq, Eq)]
-pub enum ObservedAuthorityIdentity {
+pub struct ObservedAuthorityIdentity(IdentityKind);
+
+#[derive(Clone, PartialEq, Eq)]
+enum IdentityKind {
     Source {
         repository: String,
         revision: String,
-        fingerprint: Option<String>,
+        fingerprint: Option<NormalizedFingerprint>,
     },
     Contract {
         publisher: String,
@@ -116,15 +119,27 @@ pub enum ObservedAuthorityIdentity {
         contract: String,
         build: Option<String>,
         document_digest: Option<String>,
-        fingerprint: Option<String>,
+        fingerprint: Option<NormalizedFingerprint>,
     },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct NormalizedFingerprint(String);
+
+impl NormalizedFingerprint {
+    fn parse(value: &str) -> Result<Self, CatalogError> {
+        if !valid_identity_text(value) {
+            return Err(CatalogError::InvalidIdentity);
+        }
+        Ok(Self(value.to_owned()))
+    }
 }
 
 impl fmt::Debug for ObservedAuthorityIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
-            Self::Source { .. } => "source",
-            Self::Contract { .. } => "contract",
+            Self(IdentityKind::Source { .. }) => "source",
+            Self(IdentityKind::Contract { .. }) => "contract",
         };
         formatter
             .debug_struct("ObservedAuthorityIdentity")
@@ -146,7 +161,7 @@ impl ObservedAuthorityIdentity {
         Self::source_with_fingerprint(repository, revision, None)
     }
 
-    pub fn source_with_fingerprint(
+    pub(crate) fn source_with_fingerprint(
         repository: &str,
         revision: &str,
         fingerprint: Option<&str>,
@@ -154,14 +169,12 @@ impl ObservedAuthorityIdentity {
         if !valid_identity_text(repository) || !valid_revision_text(revision) {
             return Err(CatalogError::InvalidIdentity);
         }
-        if fingerprint.is_some_and(|value| !valid_identity_text(value)) {
-            return Err(CatalogError::InvalidIdentity);
-        }
-        Ok(Self::Source {
+        let fingerprint = fingerprint.map(NormalizedFingerprint::parse).transpose()?;
+        Ok(Self(IdentityKind::Source {
             repository: repository.to_owned(),
             revision: revision.to_owned(),
-            fingerprint: fingerprint.map(str::to_owned),
-        })
+            fingerprint,
+        }))
     }
 
     pub fn contract(
@@ -174,7 +187,7 @@ impl ObservedAuthorityIdentity {
         Self::contract_with_fingerprint(publisher, revision, contract, build, document_digest, None)
     }
 
-    pub fn contract_with_fingerprint(
+    pub(crate) fn contract_with_fingerprint(
         publisher: &str,
         revision: &str,
         contract: &str,
@@ -187,27 +200,27 @@ impl ObservedAuthorityIdentity {
             || !valid_identity_text(contract)
             || build.is_some_and(|value| !valid_identity_text(value))
             || document_digest.is_some_and(|value| !valid_digest(value))
-            || fingerprint.is_some_and(|value| !valid_identity_text(value))
         {
             return Err(CatalogError::InvalidIdentity);
         }
-        Ok(Self::Contract {
+        let fingerprint = fingerprint.map(NormalizedFingerprint::parse).transpose()?;
+        Ok(Self(IdentityKind::Contract {
             publisher: publisher.to_owned(),
             revision: revision.to_owned(),
             contract: contract.to_owned(),
             build: build.map(str::to_owned),
             document_digest: document_digest.map(str::to_owned),
-            fingerprint: fingerprint.map(str::to_owned),
-        })
+            fingerprint,
+        }))
     }
 }
 
 impl AuthorityPin {
     fn matches(&self, identity: &ObservedAuthorityIdentity) -> bool {
-        match (self, identity) {
+        match (self, &identity.0) {
             (
                 Self::Source(pin),
-                ObservedAuthorityIdentity::Source {
+                IdentityKind::Source {
                     repository,
                     revision,
                     ..
@@ -215,7 +228,7 @@ impl AuthorityPin {
             ) => pin.repository == repository && pin.revision.0 == revision,
             (
                 Self::Contract(pin),
-                ObservedAuthorityIdentity::Contract {
+                IdentityKind::Contract {
                     publisher,
                     revision,
                     contract,
@@ -441,9 +454,12 @@ impl ProviderCatalog {
 }
 
 fn observed_fingerprint(identity: &ObservedAuthorityIdentity) -> Option<&str> {
-    match identity {
-        ObservedAuthorityIdentity::Source { fingerprint, .. }
-        | ObservedAuthorityIdentity::Contract { fingerprint, .. } => fingerprint.as_deref(),
+    match &identity.0 {
+        IdentityKind::Source { fingerprint, .. } | IdentityKind::Contract { fingerprint, .. } => {
+            fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.0.as_str())
+        }
     }
 }
 
@@ -500,6 +516,7 @@ fn validate_catalog(entries: &[AuthorityRef]) -> Result<(), CatalogError> {
                     || citation.url.is_empty()
                     || !valid_citation_url(citation.url)
                     || citation_revision(citation.url) != Some(pin_revision(entry.pin))
+                    || !citation_owner_matches(citation.url, entry.pin)
             })
         {
             return Err(CatalogError::InvalidCitation);
@@ -649,6 +666,25 @@ fn valid_citation_url(value: &str) -> bool {
 
 fn citation_revision(value: &str) -> Option<&str> {
     value.split("/blob/").nth(1).and_then(|rest| rest.get(..40))
+}
+
+fn citation_owner_matches(value: &str, pin: AuthorityPin) -> bool {
+    let Some(repository) = value
+        .strip_prefix("https://github.com/")
+        .and_then(|value| value.split("/blob/").next())
+    else {
+        return false;
+    };
+    match pin {
+        AuthorityPin::Source(pin) => repository == pin.repository,
+        AuthorityPin::Contract(pin) => match pin.publisher {
+            "Apple" => repository == "apple-oss-distributions/launchd",
+            "systemd" => repository == "systemd/systemd",
+            "cronie-crond" => repository == "cronie-crond/cronie",
+            "yo8192/fcron" => repository == "yo8192/fcron",
+            _ => false,
+        },
+    }
 }
 
 fn valid_date(value: &str) -> bool {
@@ -974,6 +1010,16 @@ mod tests {
         assert_eq!(darwin.citations().len(), 2);
         assert_eq!(darwin.lifecycle().state(), LifecycleState::Active);
         assert_eq!(darwin.lifecycle().first_audited_on(), "2026-07-17");
+        const WRONG_OWNER: &[SourceCitation] = &[SourceCitation {
+            title: "wrong owner",
+            url: "https://github.com/evil/nix/blob/035f34f13f969cf72ca4ea60369d907972402956/source",
+        }];
+        let mut invalid = CATALOG[0];
+        invalid.citations = WRONG_OWNER;
+        assert!(matches!(
+            validate_catalog(&[invalid]),
+            Err(CatalogError::InvalidCitation)
+        ));
     }
 
     #[test]
