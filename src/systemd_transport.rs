@@ -179,7 +179,7 @@ mod linux {
                     crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
                 ))),
                 Ok(None) => Ok(None),
-                Err(_) => Ok(None),
+                Err(error) => Err(*error),
             };
             // systemd v261 exposes no Manager.Generation property. Keep that
             // absence explicit instead of fabricating a race-free sequence.
