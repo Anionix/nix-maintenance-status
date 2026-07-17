@@ -115,7 +115,8 @@ cargo test --all-targets
 nix flake check
 ```
 
-現在、Rustクレートにサードパーティ依存関係はありません。
+macOS経路は依存関係なしで動作します。Linux限定のtransportは版を固定した
+`zbus` adapterを使用しますが、NixOS統合はまだ計画中です。
 
 ## コントリビューションとセキュリティ
 

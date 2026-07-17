@@ -95,8 +95,7 @@ pub struct SystemdBusSnapshot {
     capture: CaptureSequence,
     configured: Presence,
     loaded: Presence,
-    generation_before: u64,
-    generation_after: u64,
+    generation: Option<(u64, u64)>,
     properties: Result<Option<SystemdTimerProperties>, SystemdBusError>,
 }
 
@@ -117,9 +116,53 @@ impl SystemdBusSnapshot {
         generation_after: u64,
         properties: Result<Option<SystemdTimerProperties>, SystemdBusError>,
     ) -> Result<Self, InputError> {
+        Self::from_generation(
+            manager,
+            subject,
+            unit,
+            source,
+            capture,
+            configured,
+            loaded,
+            Some((generation_before, generation_after)),
+            properties,
+        )
+    }
+
+    /// Construct a snapshot when the provider exposes no stable read-generation.
+    /// The absence is explicit so normalization never treats a sentinel as an
+    /// observed consistency proof.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn without_generation(
+        manager: SystemdManagerIdentity,
+        subject: Subject,
+        unit: SystemdUnitId,
+        source: SourceRootId,
+        capture: CaptureSequence,
+        configured: Presence,
+        loaded: Presence,
+        properties: Result<Option<SystemdTimerProperties>, SystemdBusError>,
+    ) -> Result<Self, InputError> {
+        Self::from_generation(
+            manager, subject, unit, source, capture, configured, loaded, None, properties,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_generation(
+        manager: SystemdManagerIdentity,
+        subject: Subject,
+        unit: SystemdUnitId,
+        source: SourceRootId,
+        capture: CaptureSequence,
+        configured: Presence,
+        loaded: Presence,
+        generation: Option<(u64, u64)>,
+        properties: Result<Option<SystemdTimerProperties>, SystemdBusError>,
+    ) -> Result<Self, InputError> {
         if (manager == SystemdManagerIdentity::System && subject != Subject::System)
-            || (manager == SystemdManagerIdentity::User
-                && !matches!(subject, Subject::Uid(_) | Subject::Unresolved(_)))
+            || (manager == SystemdManagerIdentity::User && !matches!(subject, Subject::Uid(_)))
         {
             return Err(InputError::InvalidSubject);
         }
@@ -131,10 +174,13 @@ impl SystemdBusSnapshot {
             capture,
             configured,
             loaded,
-            generation_before,
-            generation_after,
+            generation,
             properties,
         })
+    }
+
+    pub(crate) const fn generation_changed(&self) -> bool {
+        matches!(self.generation, Some((before, after)) if before != after)
     }
 }
 
@@ -211,6 +257,8 @@ fn occurrence(snapshot: &SystemdBusSnapshot) -> DefinitionOccurrence {
 // identity-free evidence. Generation changes become local Unavailable evidence.
 // NoSuchUnit is Absent only for the finite helper, all other bus failures stay
 // Unavailable, and no path performs I/O, retries, mutation, telemetry, or GC.
+// A transport without an official read-generation supplies no consistency
+// attestation; only an explicitly observed changed generation invalidates data.
 pub fn normalize_systemd_snapshot(
     snapshot: SystemdBusSnapshot,
     nixpkgs_revision: &str,
@@ -231,7 +279,7 @@ pub fn normalize_systemd_snapshot(
         SystemdUnitId::new(NIX_GC_TIMER).expect("catalogued Nix timer identity is valid");
     let expected_service =
         SystemdUnitId::new("nix-gc.service").expect("catalogued Nix service identity is valid");
-    let changed = snapshot.generation_before != snapshot.generation_after;
+    let changed = snapshot.generation_changed();
     let has_gc_identity = snapshot.manager == SystemdManagerIdentity::System
         && snapshot.unit == expected_timer
         && matches!(
@@ -346,4 +394,28 @@ pub const fn duration_from_usec(usec: u64) -> Duration {
     let seconds = usec / 1_000_000;
     let micros = usec % 1_000_000;
     Duration::new(seconds, micros as u32 * 1_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_subjects_are_rejected_at_the_systemd_boundary() {
+        let subject =
+            Subject::Unresolved(crate::evidence::SubjectOrdinal::new(1).expect("nonzero ordinal"));
+        let result = SystemdBusSnapshot::new(
+            SystemdManagerIdentity::User,
+            subject,
+            SystemdUnitId::new(NIX_GC_TIMER).unwrap(),
+            SourceRootId::new(7),
+            CaptureSequence::new(1),
+            Presence::Present,
+            Presence::Absent,
+            0,
+            0,
+            Ok(None),
+        );
+        assert_eq!(result, Err(InputError::InvalidSubject));
+    }
 }

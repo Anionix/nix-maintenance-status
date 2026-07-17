@@ -12,6 +12,10 @@ keywords = ["nix", "nix-darwin", "macos", "observability", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+[target.'cfg(target_os = "linux")'.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+zbus = { version = "=4.4.0", default-features = false, features = ["async-io"] }
+
 [lib]
 name = "nix_maintenance_status"
 path = "src/lib.rs"
