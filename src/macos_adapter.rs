@@ -39,7 +39,16 @@ pub(crate) fn normalize_plist(result: std::io::Result<bool>) -> Presence {
     match result {
         Ok(true) => Presence::Present,
         Ok(false) => Presence::Absent,
-        Err(_) => Presence::Unavailable(UnavailableReason::PermissionDenied),
+        Err(error) => Presence::Unavailable(match error.kind() {
+            std::io::ErrorKind::PermissionDenied => UnavailableReason::PermissionDenied,
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                UnavailableReason::TimedOut
+            }
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+                UnavailableReason::MalformedEvidence
+            }
+            _ => UnavailableReason::OperationFailed,
+        }),
     }
 }
 
@@ -70,6 +79,7 @@ fn launchd_occurrence() -> DefinitionOccurrence {
 }
 
 pub(crate) fn diagnostic_input() -> Result<DiagnosticInput, InputError> {
+    let started = std::time::SystemTime::now();
     let occurrence = launchd_occurrence();
     let evidence = ProviderEvidenceSet::new(vec![
         ProviderEvidence::with_occurrence(
@@ -87,11 +97,14 @@ pub(crate) fn diagnostic_input() -> Result<DiagnosticInput, InputError> {
             occurrence,
         )?,
     ])?;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(started)
+        .unwrap_or_else(|_| std::time::Duration::from_millis(1))
+        .max(std::time::Duration::from_millis(1));
     DiagnosticInput::new(
         TargetPlatform::MacOs,
         ScanScope::System,
-        ScanWindow::new(std::time::UNIX_EPOCH, std::time::Duration::from_secs(1))
-            .expect("fixed scan window is valid"),
+        ScanWindow::new(started, elapsed).expect("bounded probe window is valid"),
         evidence,
     )
 }
