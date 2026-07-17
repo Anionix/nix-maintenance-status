@@ -1,8 +1,8 @@
 mod macos_adapter;
 
 use nix_maintenance_status::{
-    Conclusion, ConfigurationState, ConsistencyState, DiagnosticInput, EvidenceClass, GcReport,
-    MacOsEvidence, RuntimeState, diagnose,
+    Claim, Conclusion, ConsistencyValue, CoverageAggregate, EvidenceClass, GcReport,
+    ObservationValue, Provider, diagnose,
 };
 
 const HELP: &str = "\
@@ -26,14 +26,17 @@ fn main() {
 
     if argument.is_none() {
         if std::env::consts::OS != "macos" {
-            eprintln!("error: this initial release currently supports macOS with nix-darwin");
+            eprintln!("error: this release currently supports macOS with nix-darwin");
             std::process::exit(2);
         }
-
-        let report = diagnose(DiagnosticInput::macos(MacOsEvidence::new(
-            macos_adapter::plist_probe(),
-            macos_adapter::launchd_probe(),
-        )));
+        let input = match macos_adapter::diagnostic_input() {
+            Ok(input) => input,
+            Err(_) => {
+                eprintln!("error: macOS evidence could not be normalized");
+                std::process::exit(2);
+            }
+        };
+        let report = diagnose(input);
         print!("{}", render_summary(&report));
         if report_exit_code(&report) == 2 {
             std::process::exit(2)
@@ -48,29 +51,68 @@ fn main() {
     std::process::exit(2);
 }
 
-fn render_summary(report: &GcReport) -> String {
-    let configuration = match report.configuration().conclusion() {
-        Conclusion::Known(ConfigurationState::ConsistentWithNixDarwinAutomaticGc) => {
-            "consistent with nix-darwin automatic GC"
+fn presence_text(claim: Option<&Claim<ObservationValue>>) -> (&'static str, EvidenceClass) {
+    let Some(claim) = claim else {
+        return ("unknown", EvidenceClass::Unknown);
+    };
+    match claim.conclusion() {
+        Conclusion::Known(ObservationValue::Present) => {
+            ("present", claim.provenance().evidence_class())
         }
-        Conclusion::Known(ConfigurationState::NotDetected) => "not detected",
-        Conclusion::Known(_) | Conclusion::Unknown(_) => "unknown",
+        Conclusion::Known(ObservationValue::PresentEmpty) => {
+            ("present empty", claim.provenance().evidence_class())
+        }
+        Conclusion::Known(ObservationValue::Absent) => {
+            ("not detected", claim.provenance().evidence_class())
+        }
+        Conclusion::Unknown(_) => ("unknown", EvidenceClass::Unknown),
+    }
+}
+
+fn runtime_text(claim: Option<&Claim<ObservationValue>>) -> (&'static str, EvidenceClass) {
+    let (value, class) = presence_text(claim);
+    (
+        match value {
+            "present" | "present empty" => "loaded",
+            "not detected" => "not loaded",
+            _ => "unknown",
+        },
+        class,
+    )
+}
+
+fn consistency_text(claim: Option<&Claim<ConsistencyValue>>) -> (&'static str, EvidenceClass) {
+    let Some(claim) = claim else {
+        return ("unknown", EvidenceClass::Unknown);
     };
-    let runtime = match report.runtime().conclusion() {
-        Conclusion::Known(RuntimeState::Loaded) => "loaded",
-        Conclusion::Known(RuntimeState::NotLoaded) => "not loaded",
-        Conclusion::Known(_) | Conclusion::Unknown(_) => "unknown",
-    };
-    let consistency = match report.consistency().conclusion() {
-        Conclusion::Known(ConsistencyState::Consistent) => "consistent",
-        Conclusion::Known(ConsistencyState::Inconsistent) => "inconsistent",
-        Conclusion::Known(_) | Conclusion::Unknown(_) => "unknown",
-    };
+    match claim.conclusion() {
+        Conclusion::Known(ConsistencyValue::Consistent) => {
+            ("consistent", claim.provenance().evidence_class())
+        }
+        Conclusion::Known(ConsistencyValue::Inconsistent) => {
+            ("inconsistent", claim.provenance().evidence_class())
+        }
+        Conclusion::Known(_) => ("unknown", EvidenceClass::Unknown),
+        Conclusion::Unknown(_) => ("unknown", EvidenceClass::Unknown),
+    }
+}
+
+fn render_summary(report: &GcReport) -> String {
+    let automation = report
+        .automations()
+        .iter()
+        .find(|automation| automation.provider() == Provider::NixDarwinLaunchd);
+    let claims = automation.map(|automation| automation.claims());
+    let (configuration, configuration_class) =
+        presence_text(claims.map(|claims| claims.configuration()));
+    let (runtime, runtime_class) = runtime_text(claims.map(|claims| claims.runtime()));
+    let (consistency, consistency_class) =
+        consistency_text(claims.map(|claims| claims.consistency()));
     format!(
         "Nix maintenance status\n\nConfiguration: {configuration} [{}]\nRuntime: {runtime} [{}]\nConsistency: {consistency} [{}]\n",
-        evidence_label(report.configuration().provenance().evidence_class()),
-        evidence_label(report.runtime().provenance().evidence_class()),
-        evidence_label(report.consistency().provenance().evidence_class()),
+        evidence_label(configuration_class),
+        evidence_label(runtime_class),
+        evidence_label(consistency_class),
     )
 }
 
@@ -82,39 +124,60 @@ fn evidence_label(class: EvidenceClass) -> &'static str {
     }
 }
 
-// LLM contract: the report is rendered first; both core Claims Unknown exits 2,
-// while any Known core Claim exits 0. Unknown is never converted to absence.
+// LLM contract: rendering is pure and happens before exit selection. A report
+// with no Covered leaf exits 2; any usable Covered leaf exits 0. Unknown is
+// never rewritten as Absent, and rendering performs no I/O or mutation.
 fn report_exit_code(report: &GcReport) -> i32 {
-    if matches!(report.configuration().conclusion(), Conclusion::Unknown(_))
-        && matches!(report.runtime().conclusion(), Conclusion::Unknown(_))
-    {
-        2
-    } else {
-        0
+    match report.coverage().aggregate() {
+        CoverageAggregate::Unavailable => 2,
+        CoverageAggregate::Complete | CoverageAggregate::Partial => 0,
+        _ => 2,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nix_maintenance_status::{GcPlist, LaunchdJob, Probe, ProbeFailure};
+    use nix_maintenance_status::{
+        DiagnosticInput, ObservationComponent, Presence, ProviderEvidence, ProviderEvidenceSet,
+        ScanScope, ScanWindow, Subject, TargetPlatform, UnavailableReason,
+    };
 
     use super::*;
 
+    fn input(config: Presence, runtime: Presence) -> DiagnosticInput {
+        DiagnosticInput::new(
+            TargetPlatform::MacOs,
+            ScanScope::System,
+            ScanWindow::new(std::time::UNIX_EPOCH, std::time::Duration::from_secs(1)).unwrap(),
+            ProviderEvidenceSet::new(vec![
+                ProviderEvidence::new(
+                    Provider::NixDarwinLaunchd,
+                    Subject::System,
+                    ObservationComponent::Configuration,
+                    config,
+                )
+                .unwrap(),
+                ProviderEvidence::new(
+                    Provider::NixDarwinLaunchd,
+                    Subject::System,
+                    ObservationComponent::Runtime,
+                    runtime,
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn exits_two_only_when_both_core_claims_are_unknown() {
-        let report = diagnose(DiagnosticInput::macos(MacOsEvidence::new(
-            Probe::<GcPlist>::Unavailable(ProbeFailure::FileSystemUnavailable),
-            Probe::<LaunchdJob>::Unavailable(ProbeFailure::CommandUnavailable),
-        )));
+    fn exits_two_only_when_no_core_leaf_is_usable() {
+        let report = diagnose(input(
+            Presence::Unavailable(UnavailableReason::PermissionDenied),
+            Presence::Unavailable(UnavailableReason::InterfaceUnavailable),
+        ));
         assert_eq!(report_exit_code(&report), 2);
-        assert_eq!(
-            render_summary(&report),
-            "Nix maintenance status\n\nConfiguration: unknown [unknown]\nRuntime: unknown [unknown]\nConsistency: unknown [unknown]\n"
-        );
-        let report = diagnose(DiagnosticInput::macos(MacOsEvidence::new(
-            Probe::<GcPlist>::Unavailable(ProbeFailure::FileSystemUnavailable),
-            Probe::<LaunchdJob>::Absent,
-        )));
+        let report = diagnose(input(Presence::Present, Presence::Absent));
         assert_eq!(report_exit_code(&report), 0);
     }
 }

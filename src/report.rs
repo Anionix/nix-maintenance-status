@@ -48,11 +48,6 @@ impl EvidenceLedger {
     pub fn iter(&self) -> impl Iterator<Item = &ReportEvidence> + '_ {
         self.entries.iter()
     }
-    pub(crate) fn empty() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
     pub(crate) fn owns(&self, evidence: &ReportEvidence) -> bool {
         self.entries
             .iter()
@@ -95,6 +90,13 @@ pub enum ObservationValue {
     Absent,
     PresentEmpty,
     Present,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ConsistencyValue {
+    Consistent,
+    Inconsistent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -148,12 +150,6 @@ impl CoverageMatrix {
     }
     pub const fn aggregate(&self) -> CoverageAggregate {
         self.aggregate
-    }
-    pub(crate) fn empty() -> Self {
-        Self {
-            leaves: Vec::new(),
-            aggregate: CoverageAggregate::Unavailable,
-        }
     }
     pub(crate) fn from_evidence(evidence: &ProviderEvidenceSet) -> Self {
         const COMPONENTS: [ObservationComponent; 8] = [
@@ -240,7 +236,7 @@ impl fmt::Debug for AutomationId {
 pub struct AutomationClaims {
     configuration: crate::diagnostic::Claim<ObservationValue>,
     runtime: crate::diagnostic::Claim<ObservationValue>,
-    consistency: crate::diagnostic::Claim<ObservationValue>,
+    consistency: crate::diagnostic::Claim<ConsistencyValue>,
     schedule: crate::diagnostic::Claim<ObservationValue>,
     command: crate::diagnostic::Claim<ObservationValue>,
     activity: crate::diagnostic::Claim<ObservationValue>,
@@ -262,13 +258,16 @@ impl AutomationClaims {
     claim_getters!(
         configuration,
         runtime,
-        consistency,
         schedule,
         command,
         activity,
         runs,
         last_result
     );
+
+    pub const fn consistency(&self) -> &crate::diagnostic::Claim<ConsistencyValue> {
+        &self.consistency
+    }
 
     pub(crate) fn from_entries(entries: &[&ProviderEvidence], ledger: &EvidenceLedger) -> Self {
         let unknown = || {
@@ -279,7 +278,9 @@ impl AutomationClaims {
         let mut claims = Self {
             configuration: unknown(),
             runtime: unknown(),
-            consistency: unknown(),
+            consistency: crate::diagnostic::Claim::unknown(
+                crate::diagnostic::UnknownReason::DependentClaimUnknown,
+            ),
             schedule: unknown(),
             command: unknown(),
             activity: unknown(),
@@ -345,6 +346,40 @@ impl AutomationClaims {
                 ObservationComponent::Discovery => unreachable!(),
             }
         }
+        let configuration = match claims.configuration.conclusion() {
+            crate::diagnostic::Conclusion::Known(value) => Some(value),
+            crate::diagnostic::Conclusion::Unknown(_) => None,
+        };
+        let runtime = match claims.runtime.conclusion() {
+            crate::diagnostic::Conclusion::Known(value) => Some(value),
+            crate::diagnostic::Conclusion::Unknown(_) => None,
+        };
+        if let (Some(configuration), Some(runtime)) = (configuration, runtime) {
+            let ids = claims
+                .configuration
+                .provenance()
+                .evidence_ids()
+                .iter()
+                .chain(claims.runtime.provenance().evidence_ids())
+                .cloned()
+                .collect();
+            let configuration_present = matches!(
+                configuration,
+                ObservationValue::Present | ObservationValue::PresentEmpty
+            );
+            let runtime_present = matches!(
+                runtime,
+                ObservationValue::Present | ObservationValue::PresentEmpty
+            );
+            claims.consistency = crate::diagnostic::Claim::inferred(
+                if configuration_present == runtime_present {
+                    ConsistencyValue::Consistent
+                } else {
+                    ConsistencyValue::Inconsistent
+                },
+                ids,
+            );
+        }
         claims
     }
 }
@@ -372,16 +407,12 @@ impl GcAutomation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum LedgerError {
-    LegacyInput,
-}
-
-// LLM contract: `build_ledger` only triggers Provider → Subject → component canonicalization with opaque IDs; #44 owns scheduler identity/capture, so rows are not candidates.
-// Claims Known/Unknown reject empty/duplicate/reversed/foreign refs; Unknown != Absent; legacy rejected; pure/read-only/offline, no telemetry, and no GC execution.
-pub fn build_ledger(input: &DiagnosticInput) -> Result<EvidenceLedger, LedgerError> {
-    let evidence = input.evidence().ok_or(LedgerError::LegacyInput)?;
+// LLM contract: `build_ledger` only triggers Provider → Subject → component
+// canonicalization with opaque IDs; identity-free rows remain evidence and
+// never become candidates.
+// Claims Known/Unknown reject empty/duplicate/reversed/foreign refs; Unknown != Absent; pure/read-only/offline, no telemetry, and no GC execution.
+pub fn build_ledger(input: &DiagnosticInput) -> EvidenceLedger {
+    let evidence = input.evidence();
     let mut values = evidence.entries().to_vec();
     values.sort_by_key(|value| {
         (
@@ -400,7 +431,7 @@ pub fn build_ledger(input: &DiagnosticInput) -> Result<EvidenceLedger, LedgerErr
             value,
         })
         .collect();
-    Ok(EvidenceLedger { entries })
+    EvidenceLedger { entries }
 }
 
 impl EvidenceLedger {

@@ -8,56 +8,12 @@ use crate::report::{
     build_ledger,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProbeFailure {
-    CommandUnavailable,
-    CommandFailed,
-    FileSystemUnavailable,
-    MalformedOutput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Probe<T> {
-    Observed(T),
-    Absent,
-    Unavailable(ProbeFailure),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GcPlist(());
-
-impl GcPlist {
-    pub const fn new() -> Self {
-        Self(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LaunchdJob(());
-
-impl LaunchdJob {
-    pub const fn new() -> Self {
-        Self(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MacOsEvidence(Probe<GcPlist>, Probe<LaunchdJob>);
-
-impl MacOsEvidence {
-    pub fn new(plist: Probe<GcPlist>, launchd: Probe<LaunchdJob>) -> Self {
-        Self(plist, launchd)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticInput {
     platform: TargetPlatform,
     scope: ScanScope,
     window: ScanWindow,
-    evidence: Option<ProviderEvidenceSet>,
-    legacy: Option<MacOsEvidence>,
+    evidence: ProviderEvidenceSet,
 }
 
 impl DiagnosticInput {
@@ -75,19 +31,8 @@ impl DiagnosticInput {
             platform,
             scope,
             window,
-            evidence: Some(evidence),
-            legacy: None,
+            evidence,
         })
-    }
-    pub fn macos(evidence: MacOsEvidence) -> Self {
-        Self {
-            platform: TargetPlatform::MacOs,
-            scope: ScanScope::System,
-            window: ScanWindow::new(std::time::UNIX_EPOCH, std::time::Duration::from_secs(1))
-                .expect("the fixed legacy window is valid"),
-            evidence: None,
-            legacy: Some(evidence),
-        }
     }
     pub const fn platform(&self) -> TargetPlatform {
         self.platform
@@ -98,8 +43,8 @@ impl DiagnosticInput {
     pub const fn window(&self) -> ScanWindow {
         self.window
     }
-    pub fn evidence(&self) -> Option<&ProviderEvidenceSet> {
-        self.evidence.as_ref()
+    pub const fn evidence(&self) -> &ProviderEvidenceSet {
+        &self.evidence
     }
 }
 
@@ -113,7 +58,6 @@ pub enum EvidenceClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnknownReason {
-    ProbeFailed(ProbeFailure),
     EvidenceUnavailable(UnavailableReason),
     DependentClaimUnknown,
 }
@@ -165,17 +109,6 @@ impl<T> Claim<T> {
         &self.provenance
     }
 
-    fn known(value: T, class: EvidenceClass) -> Self {
-        Self {
-            conclusion: Conclusion::Known(value),
-            provenance: Provenance {
-                class,
-                evidence: Vec::new(),
-                authorities: [AuthorityResolution::NotClaimed; 3],
-            },
-        }
-    }
-
     pub(crate) fn unknown(reason: UnknownReason) -> Self {
         Self {
             conclusion: Conclusion::Unknown(reason),
@@ -192,6 +125,17 @@ impl<T> Claim<T> {
             conclusion: Conclusion::Known(value),
             provenance: Provenance {
                 class: EvidenceClass::Observed,
+                evidence: ids,
+                authorities: [AuthorityResolution::NotClaimed; 3],
+            },
+        }
+    }
+
+    pub(crate) fn inferred(value: T, ids: Vec<EvidenceId>) -> Self {
+        Self {
+            conclusion: Conclusion::Known(value),
+            provenance: Provenance {
+                class: EvidenceClass::Inferred,
                 evidence: ids,
                 authorities: [AuthorityResolution::NotClaimed; 3],
             },
@@ -221,32 +165,8 @@ impl<T> Claim<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ConfigurationState {
-    ConsistentWithNixDarwinAutomaticGc,
-    NotDetected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RuntimeState {
-    Loaded,
-    NotLoaded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ConsistencyState {
-    Consistent,
-    Inconsistent,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcReport {
-    configuration: Claim<ConfigurationState>,
-    runtime: Claim<RuntimeState>,
-    consistency: Claim<ConsistencyState>,
     scan: ScanMetadata,
     coverage: CoverageMatrix,
     automations: Vec<GcAutomation>,
@@ -254,15 +174,6 @@ pub struct GcReport {
 }
 
 impl GcReport {
-    pub const fn configuration(&self) -> &Claim<ConfigurationState> {
-        &self.configuration
-    }
-    pub const fn runtime(&self) -> &Claim<RuntimeState> {
-        &self.runtime
-    }
-    pub const fn consistency(&self) -> &Claim<ConsistencyState> {
-        &self.consistency
-    }
     pub const fn scan(&self) -> &ScanMetadata {
         &self.scan
     }
@@ -277,74 +188,18 @@ impl GcReport {
     }
 }
 
-// LLM contract: plist and launchd Probes independently become Known for Observed/Absent
-// or Unknown for Unavailable. Consistency is Known only when both core Claims are Known;
-// equal presence is Consistent. Runtime never changes Configuration; Unknown is not Absent.
-// Generic validated input is classified into the immutable inventory boundary;
-// legacy MacOsEvidence retains the 0.1 core getters only during the migration
-// window and never feeds those getters from generic provider Evidence.
+// LLM contract: validated Provider Evidence is the only diagnose trigger.
+// Evidence becomes immutable ordered inventory/Coverage; Unavailable remains
+// local Unknown and no adapter fallback, I/O, network, mutation, telemetry,
+// scheduler operation, or GC execution occurs in classification.
 pub fn diagnose(input: DiagnosticInput) -> GcReport {
     let scan = ScanMetadata::new(input.platform(), input.scope(), input.window());
-    let Some(legacy) = input.legacy else {
-        let evidence = input
-            .evidence()
-            .expect("validated generic input has evidence");
-        let ledger = build_ledger(&input).unwrap_or_else(|_| EvidenceLedger::empty());
-        let (automations, coverage) = build_inventory(evidence, &ledger);
-        return GcReport {
-            configuration: Claim::unknown(UnknownReason::DependentClaimUnknown),
-            runtime: Claim::unknown(UnknownReason::DependentClaimUnknown),
-            consistency: Claim::unknown(UnknownReason::DependentClaimUnknown),
-            scan,
-            coverage,
-            automations,
-            evidence: ledger,
-        };
-    };
-    let (configuration, configured) = claim_from_probe(
-        legacy.0,
-        ConfigurationState::ConsistentWithNixDarwinAutomaticGc,
-        ConfigurationState::NotDetected,
-        EvidenceClass::Inferred,
-    );
-    let (runtime, loaded) = claim_from_probe(
-        legacy.1,
-        RuntimeState::Loaded,
-        RuntimeState::NotLoaded,
-        EvidenceClass::Observed,
-    );
-    let consistency = match (configured, loaded) {
-        (Some(configured), Some(loaded)) => Claim::known(
-            if configured == loaded {
-                ConsistencyState::Consistent
-            } else {
-                ConsistencyState::Inconsistent
-            },
-            EvidenceClass::Inferred,
-        ),
-        _ => Claim::unknown(UnknownReason::DependentClaimUnknown),
-    };
-
+    let ledger = build_ledger(&input);
+    let (automations, coverage) = build_inventory(input.evidence(), &ledger);
     GcReport {
-        configuration,
-        runtime,
-        consistency,
         scan,
-        coverage: CoverageMatrix::empty(),
-        automations: Vec::new(),
-        evidence: EvidenceLedger::empty(),
-    }
-}
-
-fn claim_from_probe<T, U>(
-    probe: Probe<T>,
-    present: U,
-    absent: U,
-    present_class: EvidenceClass,
-) -> (Claim<U>, Option<bool>) {
-    match probe {
-        Probe::Observed(_) => (Claim::known(present, present_class), Some(true)),
-        Probe::Absent => (Claim::known(absent, EvidenceClass::Observed), Some(false)),
-        Probe::Unavailable(failure) => (Claim::unknown(UnknownReason::ProbeFailed(failure)), None),
+        coverage,
+        automations,
+        evidence: ledger,
     }
 }
