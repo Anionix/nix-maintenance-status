@@ -310,7 +310,9 @@ mod linux {
                     return Err(error);
                 }
             };
-            if !effective_unit(&unit_values)? {
+            let effective = effective_unit(&unit_values)?;
+            println!("temporary systemd probe: effective_unit={effective}");
+            if !effective {
                 return Ok(SystemdCommandIdentity::unknown(
                     crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
                 ));
