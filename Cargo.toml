@@ -12,6 +12,9 @@ keywords = ["nix", "nix-darwin", "macos", "observability", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+[features]
+systemd-vm-probe = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,3 +27,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "nix-maintenance-status"
 path = "src/main.rs"
+
+[[bin]]
+name = "nix-maintenance-status-systemd-vm-probe"
+path = "src/bin/nix-maintenance-status-systemd-vm-probe.rs"
+required-features = ["systemd-vm-probe"]

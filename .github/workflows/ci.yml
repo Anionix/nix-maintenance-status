@@ -70,3 +70,25 @@ jobs:
           grep -Fxq 'Configuration: not detected [observed]' <<<"$report"
           grep -Fxq 'Runtime: not loaded [observed]' <<<"$report"
           grep -Fxq 'Consistency: consistent [inferred]' <<<"$report"
+
+  nixos-vm-integration:
+    name: NixOS VM integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Check the pinned NixOS VM fixtures
+        run: >-
+          nix flake check
+          --no-update-lock-file
+          --print-build-logs
+
+      - name: Verify the lockfile is unchanged
+        run: git diff --exit-code -- flake.lock
