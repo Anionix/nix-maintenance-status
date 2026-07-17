@@ -140,6 +140,16 @@ fn configuration_and_runtime_remain_independent() {
                 .presence(),
             loaded
         );
+        if configured == Presence::Present && loaded == Presence::Absent {
+            assert!(
+                report
+                    .evidence()
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.component() == ObservationComponent::Schedule
+                        && entry.presence() == Presence::Present)
+            );
+        }
     }
 }
 

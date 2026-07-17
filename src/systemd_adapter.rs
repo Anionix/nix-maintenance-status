@@ -277,7 +277,7 @@ pub fn normalize_systemd_snapshot(
             occurrence.as_ref(),
         )?,
     ];
-    if changed || runtime == Presence::Present {
+    if changed || runtime == Presence::Present || matches!(&snapshot.properties, Ok(Some(_))) {
         let schedule_presence = if changed {
             Presence::Unavailable(UnavailableReason::ChangedDuringRead)
         } else {
