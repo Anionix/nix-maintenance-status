@@ -68,9 +68,7 @@ in
       # The boundary fixture deliberately replaces the command while keeping
       # the timer shape. A production adapter must report command Unknown for
       # this administrative override rather than attributing it to Nix.
-      systemd.services.nix-gc = if official then {
-        unitConfig.ConditionPathExists = "/run/nix-maintenance-status-never";
-      } else {
+      systemd.services.nix-gc = if official then { } else {
         script = lib.mkForce "exec ${pkgs.coreutils}/bin/true";
       };
       systemd.timers.nix-gc = if official then {
