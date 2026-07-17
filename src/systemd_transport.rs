@@ -273,7 +273,7 @@ mod linux {
         ) -> Result<HashMap<String, OwnedValue>, SystemdBusError> {
             // LLM contract: GetAll is read-only and its map is bounded before
             // any named value is normalized; raw variants do not escape.
-            let values = self.call(
+            let values: HashMap<String, OwnedValue> = self.call(
                 path.as_str(),
                 SYSTEMD_PROPERTIES_INTERFACE,
                 ReadOnlyMethod::GetAll,
