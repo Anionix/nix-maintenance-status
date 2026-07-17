@@ -171,14 +171,22 @@ mod linux {
             let expected_service = crate::evidence::SystemdUnitId::new(NIX_GC_SERVICE)
                 .map_err(SystemdTransportError::InvalidInput)?;
             let command = match &properties {
-                Ok(Some(properties)) if properties.target() == &expected_service => self
-                    .unit_path(NIX_GC_SERVICE)
-                    .and_then(|path| self.service_command(&path))
-                    .map(Some),
-                Ok(Some(_)) => Ok(Some(SystemdCommandIdentity::unknown(
-                    crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
-                ))),
-                Ok(None) => Ok(None),
+                Ok(Some(properties)) if properties.target() == &expected_service => {
+                    println!("temporary systemd probe: timer_target=expected");
+                    self.unit_path(NIX_GC_SERVICE)
+                        .and_then(|path| self.service_command(&path))
+                        .map(Some)
+                }
+                Ok(Some(_)) => {
+                    println!("temporary systemd probe: timer_target=mismatch");
+                    Ok(Some(SystemdCommandIdentity::unknown(
+                        crate::systemd_adapter::SystemdCommandUnknownReason::OverrideDetected,
+                    )))
+                }
+                Ok(None) => {
+                    println!("temporary systemd probe: timer_properties=none");
+                    Ok(None)
+                }
                 Err(error) => Err(*error),
             };
             // systemd v261 exposes no Manager.Generation property. Keep that
