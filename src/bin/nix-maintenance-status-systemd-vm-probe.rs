@@ -52,6 +52,7 @@ fn main() {
         .find(|entry| entry.component() == ObservationComponent::Command)
         .map(|entry| match entry.presence() {
             Presence::Present => "present",
+            Presence::PresentEmpty => "present",
             Presence::Absent => "absent",
             Presence::Unavailable(_) => "unknown",
         })
