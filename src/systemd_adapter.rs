@@ -36,7 +36,7 @@ pub enum SystemdAuthorityUnknownReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SystemdAuthorityIdentity(());
+pub struct SystemdAuthorityIdentity(AuthorityResolution);
 
 impl SystemdAuthorityIdentity {
     // LLM contract: only an adapter-owned, catalog-resolved systemd contract
@@ -94,7 +94,11 @@ impl SystemdAuthorityIdentity {
             AuthorityResolution::Resolved(reference)
                 if reference.entry_id().as_str() == "systemd.v261.dbus.v1"
         )
-        .then_some(Self(()))
+        .then_some(Self(resolution))
+    }
+
+    pub(crate) const fn resolution(self) -> AuthorityResolution {
+        self.0
     }
 }
 
@@ -661,6 +665,10 @@ pub fn normalize_systemd_snapshot(
         AuthorityResolution::NotApplicable
     };
     let operation_authority = resolve_nix_gc_operation_authority();
+    let scheduler_authority = snapshot.authority_identity.map_or(
+        AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityUnavailable),
+        SystemdAuthorityIdentity::resolution,
+    );
     let is_mapping = matches!(
         observed_authority,
         AuthorityResolution::Resolved(reference)
@@ -702,6 +710,7 @@ pub fn normalize_systemd_snapshot(
             other => other,
         }
     };
+    let authorities = [operation_authority, authority, scheduler_authority];
     let unavailable = Presence::Unavailable(UnavailableReason::ChangedDuringRead);
     let configuration = if changed {
         unavailable
@@ -719,12 +728,14 @@ pub fn normalize_systemd_snapshot(
             configuration,
             snapshot.subject,
             occurrence.as_ref(),
+            authorities,
         )?,
         make_evidence(
             ObservationComponent::Runtime,
             runtime,
             snapshot.subject,
             occurrence.as_ref(),
+            authorities,
         )?,
     ];
     if snapshot.manager == SystemdManagerIdentity::System {
@@ -742,6 +753,7 @@ pub fn normalize_systemd_snapshot(
             command_presence,
             snapshot.subject,
             occurrence.as_ref(),
+            authorities,
         )?);
     }
     if unstable || runtime == Presence::Present || !matches!(&snapshot.properties, Ok(None)) {
@@ -761,6 +773,7 @@ pub fn normalize_systemd_snapshot(
             schedule_presence,
             snapshot.subject,
             occurrence.as_ref(),
+            authorities,
         )?;
         entries.push(if !unstable {
             if let Ok(Some(properties)) = snapshot.properties {
@@ -786,12 +799,15 @@ pub fn normalize_systemd_snapshot(
 }
 
 fn make_evidence(
+    // LLM contract: one component receives only its role's normalized
+    // Authority; duplicate, mismatched, or unclaimed transitions stay safe.
     component: ObservationComponent,
     presence: Presence,
     subject: Subject,
     occurrence: Option<&DefinitionOccurrence>,
+    authorities: [AuthorityResolution; 3],
 ) -> Result<ProviderEvidence, SystemdAdapterError> {
-    occurrence.map_or_else(
+    let evidence = occurrence.map_or_else(
         || {
             ProviderEvidence::new(Provider::NixOsSystemd, subject, component, presence)
                 .map_err(SystemdAdapterError::InvalidInput)
@@ -806,7 +822,21 @@ fn make_evidence(
             )
             .map_err(SystemdAdapterError::InvalidInput)
         },
-    )
+    )?;
+    let role = match component {
+        ObservationComponent::Configuration => Some(AuthorityRole::AutomationMapping),
+        ObservationComponent::Runtime | ObservationComponent::Schedule => {
+            Some(AuthorityRole::SchedulerSemantics)
+        }
+        ObservationComponent::Command => Some(AuthorityRole::GcOperationSemantics),
+        _ => None,
+    };
+    match role {
+        None => Ok(evidence),
+        Some(role) => evidence
+            .with_authority(role, authorities[role.index()])
+            .map_err(SystemdAdapterError::InvalidInput),
+    }
 }
 
 // LLM contract: every microsecond value maps exactly to a non-truncating
@@ -937,6 +967,23 @@ mod tests {
                 .iter()
                 .all(|entry| entry.occurrence().is_some())
         );
+        let input = crate::diagnostic::DiagnosticInput::new(
+            crate::evidence::TargetPlatform::Linux,
+            crate::evidence::ScanScope::System,
+            crate::evidence::ScanWindow::new(std::time::UNIX_EPOCH, Duration::from_secs(1))
+                .unwrap(),
+            report.evidence().clone(),
+        )
+        .unwrap();
+        let gc_report = crate::diagnostic::diagnose(input);
+        let claims = gc_report.automations()[0].claims();
+        assert!(matches!(
+            claims
+                .configuration()
+                .provenance()
+                .authority(AuthorityRole::AutomationMapping),
+            AuthorityResolution::Resolved(_)
+        ));
     }
 
     #[test]

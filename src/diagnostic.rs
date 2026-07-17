@@ -86,11 +86,7 @@ impl Provenance {
         &self.authorities
     }
     pub const fn authority(&self, role: AuthorityRole) -> AuthorityResolution {
-        self.authorities[match role {
-            AuthorityRole::GcOperationSemantics => 0,
-            AuthorityRole::AutomationMapping => 1,
-            AuthorityRole::SchedulerSemantics => 2,
-        }]
+        self.authorities[role.index()]
     }
 }
 
@@ -100,6 +96,7 @@ pub struct Claim<T> {
     provenance: Provenance,
 }
 
+#[allow(dead_code)]
 impl<T> Claim<T> {
     pub const fn conclusion(&self) -> &Conclusion<T> {
         &self.conclusion
@@ -116,6 +113,24 @@ impl<T> Claim<T> {
                 class: EvidenceClass::Unknown,
                 evidence: Vec::new(),
                 authorities: [AuthorityResolution::NotClaimed; 3],
+            },
+        }
+    }
+
+    // LLM contract: only normalized evidence may trigger this transition;
+    // it preserves Known/Unknown and class while carrying adapter authority.
+    pub(crate) fn from_parts(
+        conclusion: Conclusion<T>,
+        class: EvidenceClass,
+        ids: Vec<EvidenceId>,
+        authorities: [AuthorityResolution; 3],
+    ) -> Self {
+        Self {
+            conclusion,
+            provenance: Provenance {
+                class,
+                evidence: ids,
+                authorities,
             },
         }
     }
@@ -162,6 +177,10 @@ impl<T> Claim<T> {
                 authorities: [AuthorityResolution::NotClaimed; 3],
             },
         }
+    }
+
+    pub(crate) const fn authorities(&self) -> &[AuthorityResolution; 3] {
+        &self.provenance.authorities
     }
 }
 

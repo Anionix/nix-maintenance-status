@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use crate::catalog::{AuthorityResolution, AuthorityUnknownReason};
 use crate::diagnostic::{DiagnosticInput, EvidenceClass};
 use crate::evidence::{
     ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet, ScanScope,
@@ -479,6 +480,8 @@ impl AutomationClaims {
         &self.schedule
     }
 
+    // LLM contract: normalized rows carry matching role results; disagreement
+    // is unresolved and missing schedule payload keeps evidence/provenance.
     pub(crate) fn from_entries(entries: &[&ProviderEvidence], ledger: &EvidenceLedger) -> Self {
         let unknown = || {
             crate::diagnostic::Claim::unknown(
@@ -524,50 +527,44 @@ impl AutomationClaims {
             let conflict = component_entries
                 .iter()
                 .any(|entry| entry.presence() != first);
+            let authorities = merge_authorities(&component_entries);
             let claim = if conflict {
-                crate::diagnostic::Claim::unknown_with_evidence(
+                unknown_claim(
                     crate::diagnostic::UnknownReason::EvidenceUnavailable(
                         UnavailableReason::MalformedEvidence,
                     ),
                     ids.clone(),
+                    authorities,
                 )
             } else {
-                match first {
-                    Presence::Absent => {
-                        crate::diagnostic::Claim::observed(ObservationValue::Absent, ids.clone())
-                    }
-                    Presence::PresentEmpty => crate::diagnostic::Claim::observed(
-                        ObservationValue::PresentEmpty,
-                        ids.clone(),
-                    ),
-                    Presence::Present => {
-                        crate::diagnostic::Claim::observed(ObservationValue::Present, ids.clone())
-                    }
-                    Presence::Unavailable(reason) => {
-                        crate::diagnostic::Claim::unavailable(reason, ids.clone())
-                    }
-                }
+                presence_claim(first, ids.clone(), authorities)
             };
             match component {
                 ObservationComponent::Configuration => claims.configuration = claim,
                 ObservationComponent::Runtime => claims.runtime = claim,
                 ObservationComponent::Schedule => {
-                    if let Some(schedule) = component_entries
-                        .iter()
-                        .filter_map(|entry| entry.schedule())
-                        .next()
-                    {
-                        claims.schedule = if conflict {
-                            crate::diagnostic::Claim::unknown_with_evidence(
+                    let schedule = component_entries.iter().find_map(|entry| entry.schedule());
+                    claims.schedule = match (schedule, conflict) {
+                        (Some(schedule), false) => crate::diagnostic::Claim::from_parts(
+                            crate::diagnostic::Conclusion::Known(schedule.clone()),
+                            EvidenceClass::Observed,
+                            ids,
+                            authorities,
+                        ),
+                        _ => unknown_claim(
+                            if conflict {
                                 crate::diagnostic::UnknownReason::EvidenceUnavailable(
                                     UnavailableReason::MalformedEvidence,
-                                ),
-                                ids,
-                            )
-                        } else {
-                            crate::diagnostic::Claim::observed(schedule.clone(), ids)
-                        };
-                    }
+                                )
+                            } else if let Presence::Unavailable(reason) = first {
+                                crate::diagnostic::UnknownReason::EvidenceUnavailable(reason)
+                            } else {
+                                crate::diagnostic::UnknownReason::DependentClaimUnknown
+                            },
+                            ids,
+                            authorities,
+                        ),
+                    };
                 }
                 ObservationComponent::Command => claims.command = claim,
                 ObservationComponent::Activity => claims.activity = claim,
@@ -601,17 +598,95 @@ impl AutomationClaims {
                 runtime,
                 ObservationValue::Present | ObservationValue::PresentEmpty
             );
-            claims.consistency = crate::diagnostic::Claim::inferred(
-                if configuration_present == runtime_present {
+            let authorities = merge_claim_authorities(&[
+                claims.configuration.authorities(),
+                claims.runtime.authorities(),
+            ]);
+            claims.consistency = crate::diagnostic::Claim::from_parts(
+                crate::diagnostic::Conclusion::Known(if configuration_present == runtime_present {
                     ConsistencyValue::Consistent
                 } else {
                     ConsistencyValue::Inconsistent
-                },
+                }),
+                EvidenceClass::Inferred,
                 ids,
+                authorities,
             );
         }
         claims
     }
+}
+
+fn unknown_claim<T>(
+    // LLM contract: Unknown remains terminal for this component and retains
+    // only normalized evidence and adapter authority; it never infers value.
+    reason: crate::diagnostic::UnknownReason,
+    ids: Vec<EvidenceId>,
+    authorities: [AuthorityResolution; 3],
+) -> crate::diagnostic::Claim<T> {
+    crate::diagnostic::Claim::from_parts(
+        crate::diagnostic::Conclusion::Unknown(reason),
+        EvidenceClass::Unknown,
+        ids,
+        authorities,
+    )
+}
+
+fn presence_claim(
+    // LLM contract: Absent/Present are observed; Unavailable is Unknown, and
+    // no branch performs I/O or changes the supplied authority.
+    presence: Presence,
+    ids: Vec<EvidenceId>,
+    authorities: [AuthorityResolution; 3],
+) -> crate::diagnostic::Claim<ObservationValue> {
+    let value = match presence {
+        Presence::Absent => Some(ObservationValue::Absent),
+        Presence::PresentEmpty => Some(ObservationValue::PresentEmpty),
+        Presence::Present => Some(ObservationValue::Present),
+        Presence::Unavailable(_) => None,
+    };
+    match value {
+        None => unknown_claim(
+            crate::diagnostic::UnknownReason::EvidenceUnavailable(match presence {
+                Presence::Unavailable(reason) => reason,
+                _ => unreachable!(),
+            }),
+            ids,
+            authorities,
+        ),
+        Some(value) => crate::diagnostic::Claim::from_parts(
+            crate::diagnostic::Conclusion::Known(value),
+            EvidenceClass::Observed,
+            ids,
+            authorities,
+        ),
+    }
+}
+
+fn merge_authorities(entries: &[&ProviderEvidence]) -> [AuthorityResolution; 3] {
+    merge_claim_authorities(
+        &entries
+            .iter()
+            .map(|entry| entry.authorities())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn merge_claim_authorities(values: &[&[AuthorityResolution; 3]]) -> [AuthorityResolution; 3] {
+    // LLM contract: identical role results survive; any disagreement,
+    // including NotClaimed versus a result, becomes unresolved.
+    let mut merged = [AuthorityResolution::NotClaimed; 3];
+    for index in 0..3 {
+        let Some(first) = values.first().map(|value| value[index]) else {
+            continue;
+        };
+        merged[index] = if values.iter().all(|value| value[index] == first) {
+            first
+        } else {
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable)
+        };
+    }
+    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

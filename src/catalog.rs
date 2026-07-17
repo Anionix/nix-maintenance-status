@@ -8,6 +8,16 @@ pub enum AuthorityRole {
     SchedulerSemantics,
 }
 
+impl AuthorityRole {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::GcOperationSemantics => 0,
+            Self::AutomationMapping => 1,
+            Self::SchedulerSemantics => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum AuthorityUnknownReason {
@@ -17,13 +27,24 @@ pub enum AuthorityUnknownReason {
     ExactBasisUnverifiable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // Resolved keeps the complete static authority metadata.
 pub enum AuthorityResolution {
     Resolved(AuthorityRef),
     Unresolved(AuthorityUnknownReason),
     NotClaimed,
     NotApplicable,
+}
+
+impl fmt::Debug for AuthorityResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolved(_) => formatter.write_str("Resolved(<catalogued>)"),
+            Self::Unresolved(reason) => formatter.debug_tuple("Unresolved").field(reason).finish(),
+            Self::NotClaimed => formatter.write_str("NotClaimed"),
+            Self::NotApplicable => formatter.write_str("NotApplicable"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
