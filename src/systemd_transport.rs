@@ -5,8 +5,9 @@ use crate::systemd_adapter::SystemdBusError;
 use crate::evidence::{CaptureSequence, Presence, SourceRootId};
 #[cfg(target_os = "linux")]
 use crate::systemd_adapter::{
-    NIX_GC_SERVICE, NIX_GC_TIMER, SystemdBusSnapshot, SystemdCommandIdentity, SystemdExecStart,
-    SystemdTimerProperties, classify_nix_gc_command, normalize_nix_gc_state,
+    NIX_GC_SERVICE, NIX_GC_TIMER, SystemdAuthorityIdentity, SystemdBusSnapshot,
+    SystemdCommandIdentity, SystemdExecStart, SystemdTimerProperties, classify_nix_gc_command,
+    normalize_nix_gc_state,
 };
 
 pub const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
@@ -109,6 +110,7 @@ mod linux {
     use std::collections::HashMap;
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
 
     use zbus::blocking::Connection;
     use zbus::zvariant::{OwnedObjectPath, OwnedValue};
@@ -156,6 +158,7 @@ mod linux {
             source: SourceRootId,
             capture: CaptureSequence,
         ) -> Result<SystemdBusSnapshot, SystemdTransportError> {
+            let authority_identity = self.authority_identity();
             let configured = self.configured();
             let loaded = self.loaded();
             let properties = if loaded == Presence::Present {
@@ -191,8 +194,24 @@ mod linux {
                 loaded,
                 properties,
             )
-            .map(|snapshot| snapshot.with_command(command))
+            .map(|snapshot| {
+                snapshot
+                    .with_command(command)
+                    .with_authority_identity(authority_identity)
+            })
             .map_err(SystemdTransportError::InvalidInput)
+        }
+
+        // LLM contract: only the typed Manager.Version property may create a
+        // systemd ContractPin identity. Missing, malformed, or non-catalogued
+        // versions stay None; this probe never accepts caller Authority or
+        // performs network, mutation, telemetry, elevation, or GC execution.
+        fn authority_identity(&self) -> Option<SystemdAuthorityIdentity> {
+            let values = self
+                .properties_path(SYSTEMD_MANAGER_PATH, SYSTEMD_MANAGER_INTERFACE)
+                .ok()?;
+            let version = value::<String>(&values, "Version").ok()?;
+            SystemdAuthorityIdentity::from_version(&version)
         }
 
         fn configured(&self) -> Presence {
@@ -311,8 +330,16 @@ mod linux {
         ) -> Result<HashMap<String, OwnedValue>, SystemdBusError> {
             // LLM contract: GetAll is read-only and its map is bounded before
             // any named value is normalized; raw variants do not escape.
+            self.properties_path(path.as_str(), interface)
+        }
+
+        fn properties_path(
+            &self,
+            path: &str,
+            interface: &str,
+        ) -> Result<HashMap<String, OwnedValue>, SystemdBusError> {
             let values: HashMap<String, OwnedValue> = self.call(
-                path.as_str(),
+                path,
                 SYSTEMD_PROPERTIES_INTERFACE,
                 ReadOnlyMethod::GetAll,
                 &(interface,),
@@ -389,6 +416,10 @@ mod linux {
             .map_err(|_| SystemdBusError::InvalidSignature)
     }
 
+    // LLM contract: only a strict Nix store wrapper path is opened with
+    // O_NOFOLLOW, then the opened fd is bounded and canonicalized before
+    // reading. Symlinks, races, non-files, oversized data, and I/O errors
+    // become typed Unknown; raw paths/bytes never enter the report.
     fn read_wrapper(path: &str) -> Result<Vec<u8>, SystemdBusError> {
         const MAX_WRAPPER_BYTES: u64 = 65_536;
         if !path.starts_with("/nix/store/")
@@ -397,9 +428,11 @@ mod linux {
         {
             return Err(SystemdBusError::OperationFailed);
         }
-        let canonical =
-            std::fs::canonicalize(path).map_err(|_| SystemdBusError::OperationFailed)?;
-        if canonical != std::path::Path::new(path) {
+        if !crate::systemd_adapter::is_safe_store_path(path) {
+            return Err(SystemdBusError::OperationFailed);
+        }
+        let expected = std::fs::canonicalize(path).map_err(|_| SystemdBusError::OperationFailed)?;
+        if expected != std::path::Path::new(path) {
             return Err(SystemdBusError::OperationFailed);
         }
         let file = std::fs::OpenOptions::new()
@@ -407,6 +440,12 @@ mod linux {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|_| SystemdBusError::OperationFailed)?;
+        let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let actual =
+            std::fs::canonicalize(fd_path).map_err(|_| SystemdBusError::OperationFailed)?;
+        if actual != expected {
+            return Err(SystemdBusError::OperationFailed);
+        }
         let metadata = file
             .metadata()
             .map_err(|_| SystemdBusError::OperationFailed)?;
@@ -423,10 +462,25 @@ mod linux {
         Ok(bytes)
     }
 
+    // LLM contract: only a canonical NixOS nix-gc.service fragment with an
+    // empty, well-formed DropInPaths list is effective. A replacement,
+    // malformed path, or override remains Unknown; raw paths do not escape.
     fn effective_unit(values: &HashMap<String, OwnedValue>) -> Result<bool, SystemdBusError> {
         let fragment = value::<String>(values, "FragmentPath")?;
         let dropins = value::<Vec<String>>(values, "DropInPaths")?;
-        Ok(!fragment.is_empty() && dropins.is_empty())
+        if fragment.chars().any(char::is_control)
+            || (!fragment.ends_with("/nix-gc.service")
+                || (fragment != "/etc/systemd/system/nix-gc.service"
+                    && !crate::systemd_adapter::is_safe_store_path(&fragment)))
+        {
+            return Ok(false);
+        }
+        if dropins.iter().any(|path| {
+            path.is_empty() || path.chars().any(char::is_control) || !path.starts_with('/')
+        }) {
+            return Err(SystemdBusError::InvalidSignature);
+        }
+        Ok(dropins.is_empty())
     }
 
     // LLM contract: an empty exact reply is Absent, one exact row is Present,

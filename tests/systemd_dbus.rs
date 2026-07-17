@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use nix_maintenance_status::{
     AuthorityResolution, AuthorityUnknownReason, CaptureSequence, ObservationComponent, Presence,
-    SourceRootId, Subject, SystemdAuthorityIdentity, SystemdBusError, SystemdBusSnapshot,
-    SystemdManagerIdentity, SystemdTimerPolicy, SystemdTimerProperties, SystemdTrigger,
-    UnavailableReason, duration_from_usec, normalize_nix_gc_state, normalize_systemd_snapshot,
+    SourceRootId, Subject, SystemdBusError, SystemdBusSnapshot, SystemdManagerIdentity,
+    SystemdTimerPolicy, SystemdTimerProperties, SystemdTrigger, UnavailableReason,
+    duration_from_usec, normalize_nix_gc_state, normalize_systemd_snapshot,
 };
 
 fn properties(target: &str) -> SystemdTimerProperties {
@@ -69,38 +69,12 @@ fn snapshot_with_config(
         properties,
     )
     .unwrap()
-    .with_command(Ok(Some(command_identity())))
-    .with_authority_identity(Some(authority_identity()))
 }
 
 const REVISION: &str = "e8d924d50a462f89166e31a27bdcbbade35fd8e6";
 
-fn authority_identity() -> SystemdAuthorityIdentity {
-    SystemdAuthorityIdentity::from_pins(
-        "261",
-        "6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee",
-        "e8807564442a4348a6a7006109a2d900480c56454553ad490d5946a2dc4dcc64",
-        "16689e241f3f394bcdc5b91ba22efe2067c8b925d8de717f859426f240f4af9d",
-    )
-    .unwrap()
-}
-
-fn command_identity() -> nix_maintenance_status::SystemdCommandIdentity {
-    let path = "/nix/store/abc-unit-script-nix-gc-start/bin/nix-gc-start".to_owned();
-    let exec = nix_maintenance_status::SystemdExecStart::from_read_signature(
-        &path,
-        std::slice::from_ref(&path),
-        false,
-    )
-    .unwrap();
-    nix_maintenance_status::classify_nix_gc_command(
-        &exec,
-        Ok(b"#!/nix/store/bash/bin/bash\nset -e\n\nexec /nix/store/nix/bin/nix-collect-garbage --delete-older-than 30d\n"),
-    )
-}
-
 #[test]
-fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
+fn exact_gc_timer_observation_preserves_schedule_without_authority_injection() {
     let report = normalize_systemd_snapshot(
         snapshot(
             SystemdManagerIdentity::System,
@@ -114,7 +88,7 @@ fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
     .unwrap();
     assert!(matches!(
         report.authority(),
-        AuthorityResolution::Resolved(_)
+        AuthorityResolution::Unresolved(_)
     ));
     assert_eq!(report.evidence().entries().len(), 4);
     assert!(
@@ -122,7 +96,7 @@ fn exact_gc_timer_requires_target_service_and_preserves_schedule() {
             .evidence()
             .entries()
             .iter()
-            .all(|entry| entry.occurrence().is_some())
+            .all(|entry| entry.occurrence().is_none())
     );
 }
 
@@ -210,8 +184,7 @@ fn command_unknown_does_not_erase_schedule() {
             Presence::Present,
             3,
             Ok(Some(properties("nix-gc.service"))),
-        )
-        .with_command(Err(SystemdBusError::AccessDenied)),
+        ),
         REVISION,
     )
     .unwrap();
@@ -338,7 +311,7 @@ fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
     .unwrap();
     assert!(matches!(
         changed.authority(),
-        AuthorityResolution::Resolved(_)
+        AuthorityResolution::Unresolved(_)
     ));
     assert_identity_free(&changed);
 
