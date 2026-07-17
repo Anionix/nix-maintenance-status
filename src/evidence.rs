@@ -429,6 +429,12 @@ impl ProviderEvidence {
     pub const fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
     }
+    // LLM contract: this transition is valid only from a Present Schedule row
+    // whose provider owns the matching provider-native Schedule variant. A
+    // mismatched provider, component, Presence, or repeated attachment is
+    // rejected; success stores exactly one normalized schedule and performs no
+    // I/O, inference, or fallback. Unknown/Unavailable evidence never becomes
+    // a Known schedule.
     pub fn with_schedule(mut self, schedule: Schedule) -> Result<Self, InputError> {
         let provider_matches = matches!(
             (&self.provider, &schedule),
@@ -440,6 +446,9 @@ impl ProviderEvidence {
             || self.presence != Presence::Present
         {
             return Err(InputError::InvalidNormalizedValue);
+        }
+        if self.schedule.is_some() {
+            return Err(InputError::DuplicateEvidenceKey);
         }
         self.schedule = Some(schedule);
         Ok(self)

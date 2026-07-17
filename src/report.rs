@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    time::Duration,
 };
 
 use crate::diagnostic::{DiagnosticInput, EvidenceClass};
@@ -175,21 +176,21 @@ pub struct LaunchdSchedule {
 #[non_exhaustive]
 pub enum SystemdTrigger {
     OnCalendar(String),
-    OnActiveSec(u64),
-    OnBootSec(u64),
-    OnStartupSec(u64),
-    OnUnitActiveSec(u64),
-    OnUnitInactiveSec(u64),
+    OnActiveSec(Duration),
+    OnBootSec(Duration),
+    OnStartupSec(Duration),
+    OnUnitActiveSec(Duration),
+    OnUnitInactiveSec(Duration),
     OnClockChange,
     OnTimezoneChange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SystemdTimerPolicy {
-    accuracy_sec: Option<u64>,
-    randomized_delay_sec: Option<u64>,
+    accuracy: Option<Duration>,
+    randomized_delay: Option<Duration>,
     fixed_random_delay: bool,
-    randomized_offset_sec: Option<u64>,
+    randomized_offset: Option<Duration>,
     defer_reactivation: bool,
     persistent: bool,
     wake_system: bool,
@@ -197,35 +198,35 @@ pub struct SystemdTimerPolicy {
 
 impl SystemdTimerPolicy {
     pub const fn new(
-        accuracy_sec: Option<u64>,
-        randomized_delay_sec: Option<u64>,
+        accuracy: Option<Duration>,
+        randomized_delay: Option<Duration>,
         fixed_random_delay: bool,
-        randomized_offset_sec: Option<u64>,
+        randomized_offset: Option<Duration>,
         defer_reactivation: bool,
         persistent: bool,
         wake_system: bool,
     ) -> Self {
         Self {
-            accuracy_sec,
-            randomized_delay_sec,
+            accuracy,
+            randomized_delay,
             fixed_random_delay,
-            randomized_offset_sec,
+            randomized_offset,
             defer_reactivation,
             persistent,
             wake_system,
         }
     }
-    pub const fn accuracy_sec(&self) -> Option<u64> {
-        self.accuracy_sec
+    pub const fn accuracy(&self) -> Option<Duration> {
+        self.accuracy
     }
-    pub const fn randomized_delay_sec(&self) -> Option<u64> {
-        self.randomized_delay_sec
+    pub const fn randomized_delay(&self) -> Option<Duration> {
+        self.randomized_delay
     }
     pub const fn fixed_random_delay(&self) -> bool {
         self.fixed_random_delay
     }
-    pub const fn randomized_offset_sec(&self) -> Option<u64> {
-        self.randomized_offset_sec
+    pub const fn randomized_offset(&self) -> Option<Duration> {
+        self.randomized_offset
     }
     pub const fn defer_reactivation(&self) -> bool {
         self.defer_reactivation
