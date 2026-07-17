@@ -15,10 +15,9 @@ in
   name = "nix-maintenance-status-systemd-${variant}";
   requiredFeatures.kvm = false;
 
-  # This VM is not the Linux CLI. The Rust transport's
-  # malformed-reply and changed-during-read cases remain pure tests because
-  # systemd v261 exposes no read-generation property. No authority is inferred
-  # from Manager.Version or from these guest observations.
+  # This VM is not the Linux CLI. The Rust transport's malformed-reply and
+  # changed-during-read cases remain pure tests because systemd v261 exposes no
+  # read-generation property; guest observations do not infer authority.
   nodes.machine = { ... }:
     {
       assertions = [
