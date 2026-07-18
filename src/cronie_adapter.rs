@@ -2,9 +2,9 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use crate::evidence::{
-    CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent,
-    ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderLogicalKey,
-    SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
+    CaptureSequence, DefinitionOccurrence, DefinitionShape, InputError, ObservationComponent,
+    ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderLogicalKey, ShapeState,
+    ShapeUnknownReason, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
 };
 use crate::report::{
     CronieCommand, CronieEntry, CronieFieldAtom, CronieSchedule, CronieTimeField, CronieUserField,
@@ -568,6 +568,23 @@ pub fn evidence_for_table(
         SourceOccurrenceKey::new(SourceRoot::CronieTable(source_id), ordinal),
         CaptureSequence::new(capture),
     );
+    let occurrence = if let Some(schedule) = result.schedule() {
+        let principal = schedule
+            .entries()
+            .first()
+            .map(CronieEntry::user)
+            .filter(|user| schedule.entries().iter().all(|entry| entry.user() == *user))
+            .map(ShapeState::Known)
+            .unwrap_or(ShapeState::Unknown(ShapeUnknownReason::Ambiguous));
+        occurrence.with_shape(DefinitionShape::Cronie {
+            schedule: ShapeState::Known(schedule.clone()),
+            principal,
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        })?
+    } else {
+        occurrence
+    };
     let mut rows = Vec::new();
     for component in [
         ObservationComponent::Configuration,
@@ -704,6 +721,17 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 6);
         assert!(rows.iter().any(|row| row.schedule().is_some()));
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.occurrence())
+                .all(|occurrence| matches!(
+                    occurrence.shape(),
+                    Some(DefinitionShape::Cronie {
+                        principal: ShapeState::Known(_),
+                        ..
+                    })
+                ))
+        );
     }
 
     #[test]

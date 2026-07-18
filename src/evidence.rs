@@ -543,6 +543,25 @@ impl DefinitionOccurrence {
     }
 }
 
+/// Attach the launchd-native shape from already-normalized adapter evidence.
+///
+/// LLM contract: a valid launchd occurrence may transition once from an
+/// identity-only envelope to a Launchd shape; an absent schedule remains
+/// Unknown, and no I/O, raw plist, command, or process data crosses this seam.
+pub fn with_launchd_shape(
+    occurrence: DefinitionOccurrence,
+    schedule: Option<LaunchdSchedule>,
+) -> Result<DefinitionOccurrence, InputError> {
+    occurrence.with_shape(DefinitionShape::Launchd {
+        schedule: schedule.map_or(
+            ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            ShapeState::Known,
+        ),
+        command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        context: ShapeState::Known(ExecutionContext::System),
+    })
+}
+
 impl PartialEq for DefinitionOccurrence {
     fn eq(&self, other: &Self) -> bool {
         self.logical_key == other.logical_key
@@ -1258,6 +1277,16 @@ mod tests {
         };
         assert!(!incomplete.is_fully_known());
         assert!(!incomplete.known_equal(&incomplete));
+
+        let launchd = with_launchd_shape(launchd_occurrence("org.nix.gc", 3, 2), None).unwrap();
+        assert!(matches!(
+            launchd.shape(),
+            Some(DefinitionShape::Launchd {
+                schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                context: ShapeState::Known(ExecutionContext::System),
+            })
+        ));
 
         let fcron_shape = DefinitionShape::Fcron {
             schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),

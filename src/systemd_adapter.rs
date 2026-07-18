@@ -6,8 +6,9 @@ use crate::catalog::{
     ObservedAuthorityIdentity, ProviderCatalog,
 };
 use crate::evidence::{
-    CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent, Presence, Provider,
-    ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, SourceOccurrenceKey, SourceRoot,
+    CaptureSequence, DefinitionOccurrence, DefinitionShape, ExecutionContext, InputError,
+    ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
+    ProviderLogicalKey, ShapeState, ShapeUnknownReason, SourceOccurrenceKey, SourceRoot,
     SourceRootId, Subject, SystemdManagerIdentity, SystemdUnitId, UnavailableReason,
 };
 use crate::report::{Schedule, SystemdSchedule, SystemdTimerPolicy, SystemdTrigger};
@@ -646,6 +647,45 @@ fn occurrence(snapshot: &SystemdBusSnapshot) -> DefinitionOccurrence {
     )
 }
 
+fn systemd_shape(snapshot: &SystemdBusSnapshot, unstable: bool) -> Option<DefinitionShape> {
+    let (schedule, target) = if unstable {
+        (
+            ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+            ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+        )
+    } else {
+        match &snapshot.properties {
+            Ok(Some(properties)) => (
+                ShapeState::Known(match properties.schedule() {
+                    Schedule::Systemd(schedule) => schedule,
+                    _ => unreachable!("systemd properties yield systemd schedule"),
+                }),
+                ShapeState::Known(properties.target().clone()),
+            ),
+            Ok(None) => (
+                ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            ),
+            Err(error) => match error.presence() {
+                Presence::Unavailable(reason) => (
+                    ShapeState::Unavailable(reason),
+                    ShapeState::Unavailable(reason),
+                ),
+                _ => (
+                    ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                    ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                ),
+            },
+        }
+    };
+    Some(DefinitionShape::Systemd {
+        schedule,
+        target,
+        command: ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+        context: ShapeState::Known(ExecutionContext::System),
+    })
+}
+
 // LLM contract: normalization is triggered by one typed, bounded snapshot.
 // LLM contract: a system nix-gc.timer/service target plus exact generated
 // command admits a structural candidate; Authority and generation only govern
@@ -686,7 +726,15 @@ pub fn normalize_systemd_snapshot(
             Ok(Some(command)) if command.is_exact()
         )
         && matches!(operation_authority, AuthorityResolution::Resolved(_));
-    let occurrence = structural_identity.then(|| occurrence(&snapshot));
+    let occurrence = if structural_identity {
+        Some(
+            occurrence(&snapshot)
+                .with_shape(systemd_shape(&snapshot, unstable).expect("systemd identity has shape"))
+                .map_err(SystemdAdapterError::InvalidInput)?,
+        )
+    } else {
+        None
+    };
     let authority = if structural_identity {
         observed_authority
     } else if snapshot.manager == SystemdManagerIdentity::User {
@@ -955,6 +1003,22 @@ mod tests {
                 .entries()
                 .iter()
                 .all(|entry| entry.occurrence().is_some())
+        );
+        assert!(
+            report
+                .evidence()
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.occurrence())
+                .all(|occurrence| matches!(
+                    occurrence.shape(),
+                    Some(DefinitionShape::Systemd {
+                        schedule: ShapeState::Known(_),
+                        target: ShapeState::Known(_),
+                        command: ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+                        ..
+                    })
+                ))
         );
         let input = crate::diagnostic::DiagnosticInput::new(
             crate::evidence::TargetPlatform::Linux,
