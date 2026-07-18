@@ -976,6 +976,88 @@ mod tests {
     }
 
     #[test]
+    fn permission_denied_configuration_and_runtime_reach_report_claims() {
+        // LLM contract: an AccessDenied transport result is normalized as
+        // typed Unavailable, then local Unknown claims; it never becomes
+        // Absent, erases the structural candidate, or marks the scan global.
+        let target = SystemdUnitId::new(NIX_GC_SERVICE).unwrap();
+        let properties = SystemdTimerProperties::new(
+            target,
+            vec![SystemdTrigger::OnCalendar("03:15:00".to_owned())],
+            SystemdTimerPolicy::new(None, None, false, None, false, false, false),
+        )
+        .unwrap();
+        let path = format!("/nix/store/{STORE_HASH}-unit-script-nix-gc-start/bin/nix-gc-start");
+        let exec = SystemdExecStart::from_read_signature(&path, std::slice::from_ref(&path), false)
+            .unwrap();
+        let command = classify_nix_gc_command(
+            &exec,
+            Ok(format!(
+                "#!/nix/store/{STORE_HASH}-bash-5/bin/bash\nset -e\n\nexec /nix/store/{STORE_HASH}-nix-2.0/bin/nix-collect-garbage --delete-old\n"
+            )
+            .as_bytes()),
+        );
+        let denied = Presence::Unavailable(UnavailableReason::PermissionDenied);
+        let snapshot = SystemdBusSnapshot::new(
+            SystemdManagerIdentity::System,
+            Subject::System,
+            SystemdUnitId::new(NIX_GC_TIMER).unwrap(),
+            SourceRootId::new(1),
+            CaptureSequence::new(1),
+            denied,
+            denied,
+            1,
+            1,
+            Ok(Some(properties)),
+        )
+        .unwrap()
+        .with_command(Ok(Some(command)))
+        .with_authority_identity(Some(
+            SystemdAuthorityIdentity::from_pins(
+                "261",
+                FIXTURE_REVISION,
+                PACKAGE_DIGEST,
+                PATCH_DIGEST,
+            )
+            .unwrap(),
+        ));
+        let normalized =
+            normalize_systemd_snapshot(snapshot, "e8d924d50a462f89166e31a27bdcbbade35fd8e6")
+                .unwrap();
+        let input = crate::diagnostic::DiagnosticInput::new(
+            crate::evidence::TargetPlatform::Linux,
+            crate::evidence::ScanScope::System,
+            crate::evidence::ScanWindow::new(std::time::UNIX_EPOCH, Duration::from_secs(1))
+                .unwrap(),
+            normalized.evidence().clone(),
+        )
+        .unwrap();
+        let report = crate::diagnostic::diagnose(input);
+        assert_eq!(report.automations().len(), 1);
+        let claims = report.automations()[0].claims();
+        assert!(matches!(
+            claims.configuration().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::PermissionDenied
+                )
+            )
+        ));
+        assert!(matches!(
+            claims.runtime().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::PermissionDenied
+                )
+            )
+        ));
+        assert_eq!(
+            report.coverage().aggregate(),
+            crate::report::CoverageAggregate::Partial
+        );
+    }
+
+    #[test]
     fn authority_identity_requires_all_fixture_pins() {
         let exact = SystemdAuthorityIdentity::from_pins(
             "261",
