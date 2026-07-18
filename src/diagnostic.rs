@@ -1,7 +1,7 @@
 use crate::catalog::{AuthorityResolution, AuthorityRole};
 use crate::evidence::{
-    InputError, ProviderEvidenceSet, ScanScope, ScanWindow, TargetPlatform, UnavailableReason,
-    validate_input,
+    InputError, ObservationUnknownReason, ProviderEvidenceSet, ScanScope, ScanWindow,
+    TargetPlatform, UnavailableReason, validate_input,
 };
 use crate::report::{
     CoverageMatrix, EvidenceId, EvidenceLedger, GcAutomation, ScanMetadata, build_inventory,
@@ -59,6 +59,7 @@ pub enum EvidenceClass {
 #[non_exhaustive]
 pub enum UnknownReason {
     EvidenceUnavailable(UnavailableReason),
+    Observation(ObservationUnknownReason),
     DependentClaimUnknown,
 }
 

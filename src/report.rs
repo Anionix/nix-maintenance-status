@@ -303,9 +303,130 @@ impl LaunchdSchedule {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+pub enum CronieFieldAtom {
+    Any,
+    Value(u8),
+    Range(u8, u8, u8),
+    Step(u8),
+    Name(u8),
+    Tilde(Option<u8>, Option<u8>),
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CronieTimeField(Vec<CronieFieldAtom>);
+impl CronieTimeField {
+    pub(crate) fn new(atoms: Vec<CronieFieldAtom>) -> Result<Self, ScheduleError> {
+        (!atoms.is_empty())
+            .then_some(Self(atoms))
+            .ok_or(ScheduleError::Empty)
+    }
+    pub fn atoms(&self) -> &[CronieFieldAtom] {
+        &self.0
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum CronieUserField {
+    System,
+    UserSpool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CronieCommand(u16);
+impl CronieCommand {
+    pub(crate) const fn new(value: u16) -> Self {
+        Self(value)
+    }
+    pub const fn has_percent_input(self) -> bool {
+        self.0 != 0
+    }
+    pub const fn percent_count(self) -> u16 {
+        self.0
+    }
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CronieTimezone(String);
+impl fmt::Debug for CronieTimezone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<opaque>")
+    }
+}
+impl CronieTimezone {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum CronieDstSemantics {
+    CronieWallClock,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CronieEntry {
+    fields: [CronieTimeField; 5],
+    user: CronieUserField,
+    command: CronieCommand,
+}
+impl CronieEntry {
+    pub(crate) fn new(
+        fields: [CronieTimeField; 5],
+        user: CronieUserField,
+        command: CronieCommand,
+    ) -> Self {
+        Self {
+            fields,
+            user,
+            command,
+        }
+    }
+    pub fn fields(&self) -> &[CronieTimeField; 5] {
+        &self.fields
+    }
+    pub const fn user(&self) -> CronieUserField {
+        self.user
+    }
+    pub const fn command(&self) -> CronieCommand {
+        self.command
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CronieSchedule {
+    entries: Vec<CronieEntry>,
+    timezone: Option<CronieTimezone>,
+    random_delay_minutes: Option<u16>,
+}
+impl CronieSchedule {
+    pub(crate) fn new(
+        entries: Vec<CronieEntry>,
+        timezone: Option<CronieTimezone>,
+        random_delay_minutes: Option<u16>,
+    ) -> Result<Self, ScheduleError> {
+        (!entries.is_empty())
+            .then_some(Self {
+                entries,
+                timezone,
+                random_delay_minutes,
+            })
+            .ok_or(ScheduleError::Empty)
+    }
+    pub fn entries(&self) -> &[CronieEntry] {
+        &self.entries
+    }
+    pub fn timezone(&self) -> Option<&CronieTimezone> {
+        self.timezone.as_ref()
+    }
+    pub const fn random_delay_minutes(&self) -> Option<u16> {
+        self.random_delay_minutes
+    }
+    pub const fn dst(&self) -> CronieDstSemantics {
+        CronieDstSemantics::CronieWallClock
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Schedule {
     Launchd(LaunchdSchedule),
     Systemd(SystemdSchedule),
+    Cronie(CronieSchedule),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -396,9 +517,10 @@ impl CoverageMatrix {
                     }) {
                         match row.presence() {
                             Presence::Unavailable(reason) => unavailable = Some(reason),
-                            Presence::Absent | Presence::PresentEmpty | Presence::Present => {
-                                observed = true
-                            }
+                            Presence::Absent
+                            | Presence::PresentEmpty
+                            | Presence::Present
+                            | Presence::Unknown(_) => observed = true,
                         }
                     }
                     CoverageLeaf {
@@ -559,6 +681,8 @@ impl AutomationClaims {
                                 )
                             } else if let Presence::Unavailable(reason) = first {
                                 crate::diagnostic::UnknownReason::EvidenceUnavailable(reason)
+                            } else if let Presence::Unknown(reason) = first {
+                                crate::diagnostic::UnknownReason::Observation(reason)
                             } else {
                                 crate::diagnostic::UnknownReason::DependentClaimUnknown
                             },
@@ -666,30 +790,38 @@ fn unknown_claim<T>(
 }
 
 fn presence_claim(
-    // LLM contract: Absent/Present are observed; Unavailable is Unknown, and
-    // no branch performs I/O or changes the supplied authority.
+    // LLM contract: Absent/Present are observed; Unknown and Unavailable stay
+    // typed Unknown reasons, and no branch performs I/O or changes authority.
     presence: Presence,
     ids: Vec<EvidenceId>,
     authorities: [AuthorityResolution; 3],
 ) -> crate::diagnostic::Claim<ObservationValue> {
-    let value = match presence {
-        Presence::Absent => Some(ObservationValue::Absent),
-        Presence::PresentEmpty => Some(ObservationValue::PresentEmpty),
-        Presence::Present => Some(ObservationValue::Present),
-        Presence::Unavailable(_) => None,
-    };
-    match value {
-        None => unknown_claim(
-            crate::diagnostic::UnknownReason::EvidenceUnavailable(match presence {
-                Presence::Unavailable(reason) => reason,
-                _ => unreachable!(),
-            }),
+    match presence {
+        Presence::Absent => crate::diagnostic::Claim::from_parts(
+            crate::diagnostic::Conclusion::Known(ObservationValue::Absent),
+            EvidenceClass::Observed,
             ids,
             authorities,
         ),
-        Some(value) => crate::diagnostic::Claim::from_parts(
-            crate::diagnostic::Conclusion::Known(value),
+        Presence::PresentEmpty => crate::diagnostic::Claim::from_parts(
+            crate::diagnostic::Conclusion::Known(ObservationValue::PresentEmpty),
             EvidenceClass::Observed,
+            ids,
+            authorities,
+        ),
+        Presence::Present => crate::diagnostic::Claim::from_parts(
+            crate::diagnostic::Conclusion::Known(ObservationValue::Present),
+            EvidenceClass::Observed,
+            ids,
+            authorities,
+        ),
+        Presence::Unknown(reason) => unknown_claim(
+            crate::diagnostic::UnknownReason::Observation(reason),
+            ids,
+            authorities,
+        ),
+        Presence::Unavailable(reason) => unknown_claim(
+            crate::diagnostic::UnknownReason::EvidenceUnavailable(reason),
             ids,
             authorities,
         ),

@@ -100,10 +100,18 @@ pub enum UnavailableReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ObservationUnknownReason {
+    UnsupportedSyntax,
+    MalformedSyntax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Presence {
     Absent,
     PresentEmpty,
     Present,
+    Unknown(ObservationUnknownReason),
     Unavailable(UnavailableReason),
 }
 
@@ -482,6 +490,7 @@ impl ProviderEvidence {
             (&self.provider, &schedule),
             (Provider::NixDarwinLaunchd, Schedule::Launchd(_))
                 | (Provider::NixOsSystemd, Schedule::Systemd(_))
+                | (Provider::Cronie, Schedule::Cronie(_))
         );
         if self.component != ObservationComponent::Schedule
             || !provider_matches

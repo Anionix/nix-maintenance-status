@@ -2,10 +2,11 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use nix_maintenance_status::{
     AuthorityResolution, AuthorityRole, CaptureSequence, Conclusion, CoverageAggregate,
-    DefinitionOccurrence, DiagnosticInput, EvidenceClass, ObservationComponent, ObservationValue,
-    Presence, Provider, ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, ScanScope,
-    ScanWindow, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, SystemdManagerIdentity,
-    SystemdUnitId, TargetPlatform, UnavailableReason, diagnose,
+    DefinitionOccurrence, DiagnosticInput, EvidenceClass, ObservationComponent,
+    ObservationUnknownReason, ObservationValue, Presence, Provider, ProviderEvidence,
+    ProviderEvidenceSet, ProviderLogicalKey, ScanScope, ScanWindow, SourceOccurrenceKey,
+    SourceRoot, SourceRootId, Subject, SystemdManagerIdentity, SystemdUnitId, TargetPlatform,
+    UnavailableReason, diagnose,
 };
 
 fn input(rows: Vec<ProviderEvidence>) -> DiagnosticInput {
@@ -122,6 +123,23 @@ fn absent_and_present_empty_are_covered_observations() {
     assert_eq!(
         claims.runtime().conclusion(),
         &Conclusion::Known(ObservationValue::PresentEmpty)
+    );
+}
+
+#[test]
+fn unknown_presence_keeps_typed_reason_through_report_claim() {
+    let report = diagnose(input(vec![row(
+        ObservationComponent::Configuration,
+        Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax),
+    )]));
+    assert_eq!(
+        report.automations()[0]
+            .claims()
+            .configuration()
+            .conclusion(),
+        &Conclusion::Unknown(nix_maintenance_status::UnknownReason::Observation(
+            ObservationUnknownReason::UnsupportedSyntax,
+        ))
     );
 }
 
