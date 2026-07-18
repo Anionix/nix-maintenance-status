@@ -543,11 +543,9 @@ impl DefinitionOccurrence {
     }
 }
 
-/// Attach the launchd-native shape from already-normalized adapter evidence.
-///
-/// LLM contract: a valid launchd occurrence may transition once from an
-/// identity-only envelope to a Launchd shape; an absent schedule remains
-/// Unknown, and no I/O, raw plist, command, or process data crosses this seam.
+/// Attach a launchd-native shape from already-normalized evidence.
+/// LLM contract: one identity-only occurrence transitions once; absent schedule
+/// stays Unknown and no raw plist, command, process, or I/O crosses this seam.
 pub fn with_launchd_shape(
     occurrence: DefinitionOccurrence,
     schedule: Option<LaunchdSchedule>,

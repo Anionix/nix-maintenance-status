@@ -652,6 +652,8 @@ fn systemd_shape(
     changed: bool,
     generation_attested: bool,
 ) -> DefinitionShape {
+    // LLM contract: stable properties map to Known; changed/unattested map to
+    // typed Unavailable; command/context stay capability-limited. No I/O.
     let (schedule, target) = if changed {
         (
             ShapeState::Unavailable(UnavailableReason::ChangedDuringRead),
