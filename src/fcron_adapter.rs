@@ -1976,6 +1976,28 @@ mod tests {
         assert_eq!(schedules.len(), 2);
         assert!(schedules[0].timezone().is_none());
         assert!(schedules[1].timezone().is_some());
+        let inherited_run_frequency = b"!runfreq(7)\n%daily * 5 /bin/true\n";
+        let inherited = normalize_fcron_file(
+            stat(inherited_run_frequency.len()),
+            inherited_run_frequency,
+            stat(inherited_run_frequency.len()),
+            FcronTableKind::UserSource,
+            Some(1000),
+        );
+        let inherited_rows =
+            fcron_evidence_for_table(&inherited, Subject::uid(1000), SourceRootId::new(11), 1, 4)
+                .unwrap();
+        let inherited_schedule = inherited_rows.iter().find_map(|row| match row.schedule() {
+            Some(Schedule::Fcron(schedule)) => Some(schedule),
+            _ => None,
+        });
+        assert!(inherited_schedule.is_some_and(|schedule| {
+            schedule.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .all(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        }));
         let missing_key =
             fcron_evidence_for_table(&result, Subject::uid(1000), SourceRootId::new(9), 0, 4)
                 .unwrap();
