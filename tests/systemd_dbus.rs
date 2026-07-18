@@ -298,6 +298,9 @@ fn unknown_revision_foreign_timer_and_user_manager_keep_identity_free_evidence()
 
 #[test]
 fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
+    // systemd v261 has no documented read-generation property in the live VM;
+    // this typed fixture is the canonical changed-during-read proof. It must
+    // remain Unknown and never be presented as an atomic guest observation.
     let changed = normalize_systemd_snapshot(
         snapshot(
             SystemdManagerIdentity::System,
@@ -314,14 +317,35 @@ fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
         AuthorityResolution::Unresolved(_)
     ));
     assert_identity_free(&changed);
+    assert!(matches!(
+        changed
+            .evidence()
+            .entries()
+            .iter()
+            .find(|entry| entry.component() == ObservationComponent::Schedule)
+            .expect("changed reads retain a schedule row")
+            .presence(),
+        Presence::Unavailable(UnavailableReason::ChangedDuringRead)
+    ));
 
-    for properties in [Ok(None), Err(SystemdBusError::AccessDenied)] {
+    for (properties, expected) in [
+        (Ok(None), UnavailableReason::MalformedEvidence),
+        (
+            Err(SystemdBusError::AccessDenied),
+            UnavailableReason::PermissionDenied,
+        ),
+        (
+            Err(SystemdBusError::InvalidSignature),
+            UnavailableReason::MalformedEvidence,
+        ),
+    ] {
         let report = normalize_systemd_snapshot(
-            snapshot(
+            snapshot_with_config(
                 SystemdManagerIdentity::System,
                 "nix-gc.timer",
                 Presence::Present,
-                4,
+                Presence::Present,
+                3,
                 properties,
             ),
             REVISION,
@@ -334,8 +358,12 @@ fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
             .iter()
             .find(|entry| entry.component() == ObservationComponent::Schedule)
             .unwrap();
-        assert!(matches!(schedule.presence(), Presence::Unavailable(_)));
+        assert_eq!(schedule.presence(), Presence::Unavailable(expected));
         assert!(schedule.occurrence().is_none());
+        assert!(matches!(
+            report.authority(),
+            AuthorityResolution::Unresolved(_)
+        ));
     }
 }
 

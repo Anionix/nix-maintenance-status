@@ -15,9 +15,8 @@ in
   name = "nix-maintenance-status-systemd-${variant}";
   requiredFeatures.kvm = false;
 
-  # This VM is not the Linux CLI. The Rust transport's malformed-reply and
-  # changed-during-read cases remain pure tests because systemd v261 exposes no
-  # read-generation property; guest observations do not infer authority.
+  # This VM asserts only live local observations. Malformed/changed replies and
+  # AccessDenied remain pure typed tests; v261 exposes no read-generation property.
   nodes.machine = { ... }:
     {
       assertions = [
@@ -116,9 +115,15 @@ in
     machine.wait_for_unit("user@1000.service")
     machine.succeed("test -S /run/user/1000/bus")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
-    machine.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system automations=1 authority=unknown consistency=unknown schedule=unknown command=present observations=4'")
-    machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user automations=0 authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3'")
+    # systemd v261 may omit generated Nix unit files from ListUnitFilesByPatterns;
+    # retain Configuration=Unknown rather than infer absence from that boundary.
+    machine.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\"; test \"$output\" = 'scope=system automations=1 configuration=unknown runtime=present authority=unknown consistency=unknown schedule=unknown command=present observations=4'")
+    # Runtime enumeration is independent: a user-manager row can be loaded
+    # even when its matching unit-file listing is absent.
+    machine.succeed("output=$(runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user); echo \"$output\"; test \"$output\" = 'scope=current-user automations=0 configuration=absent runtime=absent authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3'")
     machine.fail("test -S /run/user/1001/bus")
+    machine.succeed("set +e; output=$(runuser -u bob -- env UID=1001 nix-maintenance-status-systemd-vm-probe --current-user 2>&1); status=$?; set -e; test \"$status\" -eq 2; test \"$output\" = 'scope=current-user automations=0 configuration=unknown runtime=unknown authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3 unavailable=interface-unavailable'")
+    machine.fail("runuser -u bob -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user")
     machine.succeed("test \"$(systemctl show nix-gc.service -p ActiveState --value)\" = inactive")
   '' else ''
     machine.wait_for_unit("nix-gc.timer")
@@ -129,14 +134,16 @@ in
     machine.succeed("test \"$(systemctl show nix-gc.service -p ActiveState --value)\" = inactive")
     machine.succeed("systemctl show nix-gc.timer -p LoadState --value | grep -Fx loaded")
     machine.succeed("runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user --no-pager list-unit-files")
-    machine.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system automations=0 authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
-    machine.succeed("runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user | grep -Fx 'scope=current-user automations=0 authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3'")
+    machine.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\"; test \"$output\" = 'scope=system automations=0 configuration=unknown runtime=present authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
+    machine.succeed("output=$(runuser -u alice -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user); echo \"$output\"; test \"$output\" = 'scope=current-user automations=0 configuration=absent runtime=absent authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3'")
     machine.fail("test -S /run/user/1001/bus")
+    machine.succeed("set +e; output=$(runuser -u bob -- env UID=1001 nix-maintenance-status-systemd-vm-probe --current-user 2>&1); status=$?; set -e; test \"$status\" -eq 2; test \"$output\" = 'scope=current-user automations=0 configuration=unknown runtime=unknown authority=not-applicable consistency=not-applicable schedule=unknown command=not-applicable observations=3 unavailable=interface-unavailable'")
+    machine.fail("runuser -u bob -- env UID=1000 nix-maintenance-status-systemd-vm-probe --current-user")
     machine.succeed("test -S /run/dbus/system_bus_socket")
     noJob.succeed("test -z \"$(systemctl show nix-gc.timer -p FragmentPath --value)\"")
-    noJob.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system automations=0 authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
+    noJob.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\"; test \"$output\" = 'scope=system automations=0 configuration=absent runtime=absent authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
     unloaded.succeed("systemctl list-unit-files --no-legend nix-gc.timer | grep -F nix-gc.timer")
     unloaded.fail("systemctl list-units --all --no-legend nix-gc.timer | grep -F nix-gc.timer")
-    unloaded.succeed("nix-maintenance-status-systemd-vm-probe --system | grep -Fx 'scope=system automations=0 authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
+    unloaded.succeed("output=$(nix-maintenance-status-systemd-vm-probe --system); echo \"$output\"; test \"$output\" = 'scope=system automations=0 configuration=unknown runtime=absent authority=unknown consistency=not-applicable schedule=unknown command=unknown observations=4'")
   '';
 }
