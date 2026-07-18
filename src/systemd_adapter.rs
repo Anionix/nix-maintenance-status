@@ -7,9 +7,9 @@ use crate::catalog::{
 };
 use crate::evidence::{
     CaptureSequence, DefinitionOccurrence, DefinitionShape, ExecutionContext, InputError,
-    ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
-    ProviderLogicalKey, ShapeState, ShapeUnknownReason, SourceOccurrenceKey, SourceRoot,
-    SourceRootId, Subject, SystemdManagerIdentity, SystemdUnitId, UnavailableReason,
+    ObservationComponent, ObservationUnknownReason, Presence, Provider, ProviderEvidence,
+    ProviderEvidenceSet, ProviderLogicalKey, ShapeState, ShapeUnknownReason, SourceOccurrenceKey,
+    SourceRoot, SourceRootId, Subject, SystemdManagerIdentity, SystemdUnitId, UnavailableReason,
 };
 use crate::report::{Schedule, SystemdSchedule, SystemdTimerPolicy, SystemdTrigger};
 
@@ -22,6 +22,7 @@ pub enum SystemdCommandUnknownReason {
     MalformedExecStart,
     WrapperUnavailable,
     WrapperMismatch,
+    NonGcCommand,
     NonUtf8,
     AmbiguousShell,
     OverrideDetected,
@@ -167,6 +168,7 @@ impl fmt::Debug for SystemdCommandIdentity {
 enum CommandIdentityKind {
     NixCollectGarbage,
     Unknown(SystemdCommandUnknownReason),
+    Unavailable(UnavailableReason),
 }
 
 impl SystemdCommandIdentity {
@@ -175,18 +177,46 @@ impl SystemdCommandIdentity {
         Self(CommandIdentityKind::Unknown(reason))
     }
 
+    const fn unavailable(reason: UnavailableReason) -> Self {
+        Self(CommandIdentityKind::Unavailable(reason))
+    }
+
     pub const fn is_exact(self) -> bool {
         matches!(self.0, CommandIdentityKind::NixCollectGarbage)
     }
 
-    // LLM contract: Exact is Present; every non-exact identity is Unknown and
-    // maps only to unavailable evidence, never to Absent.
+    const fn is_non_gc_override(self) -> bool {
+        matches!(
+            self.0,
+            CommandIdentityKind::Unknown(
+                SystemdCommandUnknownReason::OverrideDetected
+                    | SystemdCommandUnknownReason::NonGcCommand
+            )
+        )
+    }
+
+    // LLM contract: Exact is Present. A readable non-exact wrapper is
+    // Unknown, while wrapper transport/encoding failures are Unavailable;
+    // neither state becomes Absent.
     pub const fn presence(self) -> Presence {
         match self {
             Self(CommandIdentityKind::NixCollectGarbage) => Presence::Present,
-            Self(CommandIdentityKind::Unknown(_)) => {
-                Presence::Unavailable(UnavailableReason::MalformedEvidence)
-            }
+            Self(CommandIdentityKind::Unknown(reason)) => match reason {
+                SystemdCommandUnknownReason::WrapperUnavailable => {
+                    Presence::Unavailable(UnavailableReason::InterfaceUnavailable)
+                }
+                SystemdCommandUnknownReason::NonUtf8 => {
+                    Presence::Unavailable(UnavailableReason::UnsupportedEncoding)
+                }
+                SystemdCommandUnknownReason::MalformedExecStart
+                | SystemdCommandUnknownReason::WrapperMismatch
+                | SystemdCommandUnknownReason::NonGcCommand
+                | SystemdCommandUnknownReason::AmbiguousShell
+                | SystemdCommandUnknownReason::OverrideDetected => {
+                    Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+                }
+            },
+            Self(CommandIdentityKind::Unavailable(reason)) => Presence::Unavailable(reason),
         }
     }
 }
@@ -204,10 +234,12 @@ pub(crate) fn classify_nix_gc_command(
     }
     let bytes = match wrapper {
         Ok(bytes) => bytes,
-        Err(_) => {
-            return SystemdCommandIdentity::unknown(
-                SystemdCommandUnknownReason::WrapperUnavailable,
-            );
+        Err(error) => {
+            let reason = match error.presence() {
+                Presence::Unavailable(reason) => reason,
+                _ => UnavailableReason::InterfaceUnavailable,
+            };
+            return SystemdCommandIdentity::unavailable(reason);
         }
     };
     let script = match std::str::from_utf8(bytes) {
@@ -244,7 +276,7 @@ pub(crate) fn classify_nix_gc_command(
         return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
     };
     if !is_nix_collect_garbage_path(command) {
-        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::WrapperMismatch);
+        return SystemdCommandIdentity::unknown(SystemdCommandUnknownReason::NonGcCommand);
     }
     let mut options = words.peekable();
     while let Some(option) = options.next() {
@@ -682,8 +714,8 @@ fn systemd_shape(
 }
 
 // LLM contract: normalization is triggered by one typed, bounded snapshot.
-// LLM contract: a system nix-gc.timer/service target plus exact generated
-// command admits a structural candidate; Authority and generation only govern
+// LLM contract: a system nix-gc.timer/service target admits a structural
+// candidate before command attribution. Exact command and Authority govern
 // claim officiality/consistency, so Unknown never erases inventory membership.
 // NoSuchUnit is Absent only for the finite helper, all other bus failures stay
 // Unavailable, and no path performs I/O, retries, mutation, telemetry, or GC.
@@ -716,11 +748,7 @@ pub fn normalize_systemd_snapshot(
             snapshot.properties.as_ref(),
             Ok(Some(properties)) if properties.target() == &expected_service
         )
-        && matches!(
-            snapshot.command,
-            Ok(Some(command)) if command.is_exact()
-        )
-        && matches!(operation_authority, AuthorityResolution::Resolved(_));
+        && !matches!(snapshot.command, Ok(Some(command)) if command.is_non_gc_override());
     let occurrence = if structural_identity {
         let properties = match &snapshot.properties {
             Ok(Some(properties)) => properties,
@@ -947,6 +975,40 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_probe_errors_keep_typed_unavailable_reasons() {
+        let exec = generated_exec();
+        for (error, expected) in [
+            (
+                SystemdBusError::AccessDenied,
+                UnavailableReason::PermissionDenied,
+            ),
+            (SystemdBusError::NoReply, UnavailableReason::TimedOut),
+            (
+                SystemdBusError::ResourceLimitExceeded,
+                UnavailableReason::ResourceLimitExceeded,
+            ),
+            (
+                SystemdBusError::InvalidSignature,
+                UnavailableReason::MalformedEvidence,
+            ),
+            (
+                SystemdBusError::OperationFailed,
+                UnavailableReason::OperationFailed,
+            ),
+        ] {
+            assert_eq!(
+                classify_nix_gc_command(&exec, Err(error)).presence(),
+                Presence::Unavailable(expected)
+            );
+        }
+        assert_eq!(
+            classify_nix_gc_command(&exec, Ok(b"#!/bin/sh\nset -e\n\nexec /bin/sh -c unknown\n"),)
+                .presence(),
+            Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        );
+    }
+
+    #[test]
     fn exact_authority_is_only_created_by_the_catalogued_version() {
         assert!(SystemdAuthorityIdentity::from_version("261").is_some());
         assert!(SystemdAuthorityIdentity::from_version("262").is_none());
@@ -1034,6 +1096,56 @@ mod tests {
                 .configuration()
                 .provenance()
                 .authority(AuthorityRole::AutomationMapping),
+            AuthorityResolution::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn readable_unsupported_command_keeps_structural_candidate() {
+        let target = SystemdUnitId::new(NIX_GC_SERVICE).unwrap();
+        let properties = SystemdTimerProperties::new(
+            target,
+            vec![SystemdTrigger::OnCalendar("03:15:00".to_owned())],
+            SystemdTimerPolicy::new(None, None, false, None, false, false, false),
+        )
+        .unwrap();
+        let snapshot = SystemdBusSnapshot::new(
+            SystemdManagerIdentity::System,
+            Subject::System,
+            SystemdUnitId::new(NIX_GC_TIMER).unwrap(),
+            SourceRootId::new(2),
+            CaptureSequence::new(1),
+            Presence::Present,
+            Presence::Present,
+            1,
+            1,
+            Ok(Some(properties)),
+        )
+        .unwrap()
+        .with_command(Ok(Some(SystemdCommandIdentity::unknown(
+            SystemdCommandUnknownReason::WrapperMismatch,
+        ))));
+        let normalized =
+            normalize_systemd_snapshot(snapshot, "e8d924d50a462f89166e31a27bdcbbade35fd8e6")
+                .unwrap();
+        assert!(
+            normalized
+                .evidence()
+                .entries()
+                .iter()
+                .all(|entry| entry.occurrence().is_some())
+        );
+        assert!(normalized.evidence().entries().iter().any(|entry| {
+            entry.component() == ObservationComponent::Command
+                && entry.presence()
+                    == Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        }));
+        assert!(normalized.evidence().entries().iter().any(|entry| {
+            entry.component() == ObservationComponent::Schedule
+                && entry.presence() == Presence::Present
+        }));
+        assert!(matches!(
+            normalized.authority(),
             AuthorityResolution::Resolved(_)
         ));
     }
