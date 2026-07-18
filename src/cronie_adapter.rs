@@ -569,25 +569,16 @@ pub fn evidence_for_table(
         CaptureSequence::new(capture),
     );
     // LLM contract: every table result transitions its identity-only
-    // occurrence once to a Cronie shape. Present schedules/principals are
-    // Known, mixed principals are Ambiguous, absent/empty values are Unknown,
-    // and read failures are Unavailable; command/context never get inferred.
+    // occurrence once to a Cronie shape. Present schedules are Known, while
+    // principals remain Unknown because account names are redacted; absent/
+    // empty values are Unknown and read failures are Unavailable.
     let shape = match result {
-        CronieTableResult::Present(schedule) => {
-            let principal = schedule
-                .entries()
-                .first()
-                .map(CronieEntry::user)
-                .filter(|user| schedule.entries().iter().all(|entry| entry.user() == *user))
-                .map(ShapeState::Known)
-                .unwrap_or(ShapeState::Unknown(ShapeUnknownReason::Ambiguous));
-            DefinitionShape::Cronie {
-                schedule: ShapeState::Known(schedule.clone()),
-                principal,
-                command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            }
-        }
+        CronieTableResult::Present(schedule) => DefinitionShape::Cronie {
+            schedule: ShapeState::Known(schedule.clone()),
+            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        },
         CronieTableResult::Absent | CronieTableResult::PresentEmpty => DefinitionShape::Cronie {
             schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
             principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
@@ -750,7 +741,7 @@ mod tests {
                 .all(|occurrence| matches!(
                     occurrence.shape(),
                     Some(DefinitionShape::Cronie {
-                        principal: ShapeState::Known(_),
+                        principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
                         ..
                     })
                 ))
