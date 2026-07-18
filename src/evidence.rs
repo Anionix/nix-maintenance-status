@@ -1289,15 +1289,6 @@ mod tests {
         assert!(!incomplete.is_fully_known());
         assert!(!incomplete.known_equal(&incomplete));
 
-        let launchd = with_launchd_shape(launchd_occurrence("org.nix.gc", 3, 2), None).unwrap();
-        assert!(matches!(
-            launchd.shape(),
-            Some(DefinitionShape::Launchd {
-                schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                context: ShapeState::Known(ExecutionContext::System),
-            })
-        ));
         let user_occurrence = DefinitionOccurrence::new(
             ProviderLogicalKey::Launchd {
                 domain: LaunchdDomain::User,

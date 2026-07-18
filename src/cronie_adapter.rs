@@ -603,8 +603,8 @@ pub fn evidence_for_table(
         CronieTableResult::Unavailable(reason) => DefinitionShape::Cronie {
             schedule: ShapeState::Unavailable(*reason),
             principal: ShapeState::Unavailable(*reason),
-            command: ShapeState::Unavailable(*reason),
-            context: ShapeState::Unavailable(*reason),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
         },
     };
     let occurrence = occurrence.with_shape(shape)?;
@@ -807,7 +807,9 @@ mod tests {
                         occurrence.shape(),
                         Some(DefinitionShape::Cronie {
                             schedule: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
-                            ..
+                            principal: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
+                            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
                         })
                     )
                 })
