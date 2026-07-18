@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::anacron_adapter::AnacronDate;
 use crate::catalog::{AuthorityResolution, AuthorityRole};
 use crate::report::Schedule;
 
@@ -210,6 +211,12 @@ normalized_identifier!(SystemdUnitId, pub);
 normalized_identifier!(AnacronStateNamespace, pub);
 normalized_identifier!(AnacronJobId, pub);
 
+impl AnacronJobId {
+    pub(crate) fn normalized(&self) -> &str {
+        &(self.0).0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceRootId(u32);
 
@@ -347,6 +354,7 @@ pub struct ProviderEvidence {
     presence: Presence,
     occurrence: Option<DefinitionOccurrence>,
     schedule: Option<Schedule>,
+    last_attempt: Option<AnacronDate>,
     authorities: [AuthorityResolution; 3],
 }
 
@@ -364,6 +372,7 @@ impl ProviderEvidence {
             presence,
             occurrence: None,
             schedule: None,
+            last_attempt: None,
             authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
@@ -420,6 +429,7 @@ impl ProviderEvidence {
             presence,
             occurrence: Some(occurrence),
             schedule: None,
+            last_attempt: None,
             authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
@@ -441,6 +451,9 @@ impl ProviderEvidence {
     }
     pub const fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
+    }
+    pub const fn last_attempt(&self) -> Option<AnacronDate> {
+        self.last_attempt
     }
     pub const fn authority(&self, role: AuthorityRole) -> AuthorityResolution {
         self.authorities[role.index()]
@@ -491,6 +504,7 @@ impl ProviderEvidence {
             (Provider::NixDarwinLaunchd, Schedule::Launchd(_))
                 | (Provider::NixOsSystemd, Schedule::Systemd(_))
                 | (Provider::Cronie, Schedule::Cronie(_))
+                | (Provider::Anacron, Schedule::Anacron(_))
         );
         if self.component != ObservationComponent::Schedule
             || !provider_matches
@@ -502,6 +516,20 @@ impl ProviderEvidence {
             return Err(InputError::DuplicateEvidenceKey);
         }
         self.schedule = Some(schedule);
+        Ok(self)
+    }
+
+    // LLM contract: only an Anacron LastResult row carrying a date-side
+    // claim may attach it; result success/count is never inferred.
+    pub(crate) fn with_last_attempt(mut self, date: AnacronDate) -> Result<Self, InputError> {
+        if self.provider != Provider::Anacron
+            || self.component != ObservationComponent::LastResult
+            || self.presence != Presence::Unavailable(UnavailableReason::ConsistencyNotAttested)
+            || self.last_attempt.is_some()
+        {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        self.last_attempt = Some(date);
         Ok(self)
     }
 }
