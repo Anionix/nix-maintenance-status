@@ -936,9 +936,6 @@ fn parse_options(value: &str) -> Result<Vec<FcronOption>, ObservationUnknownReas
             "until" => {
                 let value =
                     parse_time_value(argument.ok_or(ObservationUnknownReason::MalformedSyntax)?)?;
-                if value.seconds() == 0 {
-                    return Err(ObservationUnknownReason::MalformedSyntax);
-                }
                 FcronOption::Until(value)
             }
             "volatile" => FcronOption::Volatile(bool_value(true)?),
@@ -1265,10 +1262,12 @@ fn parse_field(value: &str, min: u8, max: u8, names: bool) -> Result<FcronTimeFi
             continue;
         }
         let (start, end) = if let Some((start, end)) = base.split_once('-') {
-            (
-                parse_value(start, min, max, names)?,
-                parse_value(end, min, max, names)?,
-            )
+            let start = parse_value(start, min, max, names)?;
+            let end = parse_value(end, min, max, names)?;
+            if start > end {
+                return Err(());
+            }
+            (start, end)
         } else {
             let value = parse_value(base, min, max, names)?;
             (value, value)
@@ -1799,6 +1798,21 @@ mod tests {
                     Some(FcronLoadAverage::from_tenths(16)),
                 ]
         )));
+        assert!(matches!(
+            parse_fcron("!until(0)\n@daily /bin/true\n", FcronTableKind::UserSource),
+            Ok(Some(_))
+        ));
+        let descending = b"10-5 * * * * /bin/true\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(descending.len()),
+                descending,
+                stat(descending.len()),
+                FcronTableKind::UserSource,
+                Some(1000)
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
         let rows = fcron_evidence_for_table(
             &FcronTableResult::PresentEmpty,
             Subject::uid(1000),
