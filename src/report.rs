@@ -7,8 +7,9 @@ use std::{
 use crate::catalog::{AuthorityResolution, AuthorityUnknownReason};
 use crate::diagnostic::{DiagnosticInput, EvidenceClass};
 use crate::evidence::{
-    ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet, ScanScope,
-    ScanWindow, Subject, TargetPlatform, UnavailableReason,
+    ObservationComponent, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
+    ProviderLogicalKey, ScanScope, ScanWindow, SourceOccurrenceKey, Subject, TargetPlatform,
+    UnavailableReason,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1062,7 +1063,13 @@ impl AutomationClaims {
                 ObservationComponent::Runtime => claims.runtime = claim,
                 ObservationComponent::Schedule => {
                     let schedule = component_entries.iter().find_map(|entry| entry.schedule());
-                    claims.schedule = match (schedule, conflict) {
+                    let schedule_conflict = schedule.is_some_and(|first| {
+                        component_entries
+                            .iter()
+                            .filter_map(|entry| entry.schedule())
+                            .any(|candidate| candidate != first)
+                    });
+                    claims.schedule = match (schedule, conflict || schedule_conflict) {
                         (Some(schedule), false) => crate::diagnostic::Claim::from_parts(
                             crate::diagnostic::Conclusion::Known(schedule.clone()),
                             EvidenceClass::Observed,
@@ -1308,74 +1315,81 @@ impl EvidenceLedger {
     }
 }
 
-// LLM contract: generic Evidence is the sole trigger for inventory rows. A
-// Cronie/fcron occurrence is selected only when at least one row is Present,
-// then every row for that occurrence is retained for claims and provenance.
-// Identity-free rows and non-Present occurrences with no Present companion
-// remain ledger/Coverage evidence. Providers with structural occurrences
-// (for example systemd) retain their existing candidate semantics until their
-// provider ticket defines the same cardinality boundary. Sorting is canonical
-// and this function performs no I/O, network, mutation, telemetry, scheduler
-// operation, or GC execution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InventoryIdentity {
+    subject: Subject,
+    provider_order: u8,
+    provider: Provider,
+    logical_key: ProviderLogicalKey,
+    source: Option<SourceOccurrenceKey>,
+}
+
+impl InventoryIdentity {
+    fn from_entry(entry: &ProviderEvidence) -> Option<Self> {
+        let occurrence = entry.occurrence()?;
+        match occurrence.logical_key() {
+            ProviderLogicalKey::Anonymous => Some(Self {
+                subject: entry.subject(),
+                provider_order: entry.provider().catalog_order(),
+                provider: entry.provider(),
+                logical_key: ProviderLogicalKey::Anonymous,
+                source: Some(occurrence.source().clone()),
+            }),
+            key => Some(Self {
+                subject: entry.subject(),
+                provider_order: entry.provider().catalog_order(),
+                provider: entry.provider(),
+                logical_key: key.clone(),
+                source: None,
+            }),
+        }
+    }
+
+    fn is_anonymous(&self) -> bool {
+        matches!(self.logical_key, ProviderLogicalKey::Anonymous)
+    }
+}
+
+// LLM contract: Enumerated -> Classified is a pure monotone transition. An
+// identity-bearing row becomes a candidate when its provider contract
+// enumerated the definition; Cronie/fcron Anonymous candidates require one
+// Present row for their source occurrence. Proven logical aliases merge by
+// ProviderLogicalKey, capture never changes identity, and Unknown/Unavailable
+// never become Absent. No I/O, network, telemetry, mutation, elevation,
+// scheduler operation, or GC execution occurs in this projection.
 pub(crate) fn build_inventory(
     evidence: &ProviderEvidenceSet,
     ledger: &EvidenceLedger,
 ) -> (Vec<GcAutomation>, CoverageMatrix) {
-    let mut groups: BTreeMap<
-        (
-            Provider,
-            Subject,
-            Option<crate::evidence::DefinitionOccurrence>,
-        ),
-        Vec<&ProviderEvidence>,
-    > = BTreeMap::new();
-    let selected_occurrences: BTreeSet<(Provider, Subject, crate::evidence::DefinitionOccurrence)> =
-        evidence
-            .entries()
-            .iter()
-            .filter_map(|entry| {
-                (matches!(entry.provider(), Provider::Cronie | Provider::Fcron)
-                    && entry.presence() == Presence::Present)
-                    .then(|| {
-                        entry
-                            .occurrence()
-                            .cloned()
-                            .map(|occurrence| (entry.provider(), entry.subject(), occurrence))
-                    })
-                    .flatten()
-            })
-            .collect();
-    for entry in evidence.entries().iter().filter(|entry| {
-        let Some(occurrence) = entry.occurrence() else {
-            return false;
+    let mut groups: BTreeMap<InventoryIdentity, Vec<&ProviderEvidence>> = BTreeMap::new();
+    let selected_anonymous: BTreeSet<InventoryIdentity> = evidence
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(entry.provider(), Provider::Cronie | Provider::Fcron)
+                && entry.presence() == Presence::Present
+        })
+        .filter_map(InventoryIdentity::from_entry)
+        .filter(InventoryIdentity::is_anonymous)
+        .collect();
+    for entry in evidence.entries() {
+        let Some(identity) = InventoryIdentity::from_entry(entry) else {
+            continue;
         };
-        !matches!(entry.provider(), Provider::Cronie | Provider::Fcron)
-            || selected_occurrences.contains(&(
-                entry.provider(),
-                entry.subject(),
-                occurrence.clone(),
-            ))
-    }) {
-        groups
-            .entry((
-                entry.provider(),
-                entry.subject(),
-                entry.occurrence().cloned(),
-            ))
-            .or_default()
-            .push(entry);
+        if identity.is_anonymous() && !selected_anonymous.contains(&identity) {
+            continue;
+        }
+        groups.entry(identity).or_default().push(entry);
     }
     let automations = groups
         .into_iter()
         .enumerate()
-        .map(
-            |(ordinal, ((provider, subject, _), entries))| GcAutomation {
-                id: AutomationId(ordinal as u32),
-                subject,
-                provider,
-                claims: AutomationClaims::from_entries(&entries, ledger),
-            },
-        )
+        .map(|(ordinal, (identity, entries))| GcAutomation {
+            id: AutomationId(ordinal as u32),
+            subject: identity.subject,
+            provider: identity.provider,
+            claims: AutomationClaims::from_entries(&entries, ledger),
+        })
         .collect();
     (automations, CoverageMatrix::from_evidence(evidence))
 }
