@@ -16,6 +16,7 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unreachable_patterns)]
 fn main() {
     let current_user = std::env::args().any(|arg| arg == "--current-user");
     let scope = if current_user {
@@ -51,7 +52,9 @@ fn main() {
             Presence::Present => "present",
             Presence::PresentEmpty => "present",
             Presence::Absent => "absent",
+            Presence::Unknown(_) => "unknown",
             Presence::Unavailable(_) => "unknown",
+            _ => "unknown",
         })
         .unwrap_or("not-applicable");
     let configuration = evidence_presence(report.evidence(), ObservationComponent::Configuration);
@@ -135,6 +138,7 @@ fn authority_label(authority: nix_maintenance_status::AuthorityResolution) -> &'
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unreachable_patterns)]
 fn evidence_presence(
     evidence: &nix_maintenance_status::ProviderEvidenceSet,
     component: nix_maintenance_status::ObservationComponent,
@@ -146,19 +150,24 @@ fn evidence_presence(
         .map_or("unknown", |entry| match entry.presence() {
             Presence::Present | Presence::PresentEmpty => "present",
             Presence::Absent => "absent",
+            Presence::Unknown(_) => "unknown",
             Presence::Unavailable(_) => "unknown",
+            _ => "unknown",
         })
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unreachable_patterns)]
 fn transport_error_reason(error: SystemdTransportError) -> UnavailableReason {
     // LLM contract: failures map to typed UnavailableReason, never raw text or Absent.
     match error {
         SystemdTransportError::Bus(error) => match error.presence() {
             Presence::Unavailable(reason) => reason,
-            Presence::Absent | Presence::PresentEmpty | Presence::Present => {
-                UnavailableReason::InterfaceUnavailable
-            }
+            Presence::Absent
+            | Presence::PresentEmpty
+            | Presence::Present
+            | Presence::Unknown(_)
+            | _ => UnavailableReason::InterfaceUnavailable,
         },
         SystemdTransportError::InvalidInput(_) => UnavailableReason::MalformedEvidence,
         _ => UnavailableReason::InterfaceUnavailable,
