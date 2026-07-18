@@ -31,14 +31,32 @@ fn row(component: ObservationComponent, presence: Presence) -> ProviderEvidence 
 }
 
 fn occurrence() -> DefinitionOccurrence {
+    systemd_occurrence(1, 1, 0)
+}
+
+fn systemd_occurrence(source_id: u32, ordinal: u32, capture: u32) -> DefinitionOccurrence {
     DefinitionOccurrence::new(
         ProviderLogicalKey::Systemd {
             manager: SystemdManagerIdentity::System,
             subject: Subject::System,
             canonical_timer_id: SystemdUnitId::new("nix-gc.timer").unwrap(),
         },
-        SourceOccurrenceKey::new(SourceRoot::SystemdUnit(SourceRootId::new(1)), 1),
-        CaptureSequence::new(0),
+        SourceOccurrenceKey::new(
+            SourceRoot::SystemdUnit(SourceRootId::new(source_id)),
+            ordinal,
+        ),
+        CaptureSequence::new(capture),
+    )
+}
+
+fn anonymous_occurrence(source_id: u32, ordinal: u32, capture: u32) -> DefinitionOccurrence {
+    DefinitionOccurrence::new(
+        ProviderLogicalKey::Anonymous,
+        SourceOccurrenceKey::new(
+            SourceRoot::CronieTable(SourceRootId::new(source_id)),
+            ordinal,
+        ),
+        CaptureSequence::new(capture),
     )
 }
 
@@ -194,4 +212,112 @@ fn identity_free_rows_stay_evidence_and_do_not_create_candidates() {
     );
     assert!(report.automations().is_empty());
     assert_eq!(report.evidence().len(), 1);
+}
+
+#[test]
+fn proven_logical_aliases_merge_and_union_component_evidence() {
+    let configuration = ProviderEvidence::with_occurrence(
+        Provider::NixOsSystemd,
+        Subject::System,
+        ObservationComponent::Configuration,
+        Presence::Present,
+        systemd_occurrence(1, 1, 0),
+    )
+    .unwrap();
+    let runtime = ProviderEvidence::with_occurrence(
+        Provider::NixOsSystemd,
+        Subject::System,
+        ObservationComponent::Runtime,
+        Presence::Present,
+        systemd_occurrence(2, 1, 7),
+    )
+    .unwrap();
+    let configuration_alias = ProviderEvidence::with_occurrence(
+        Provider::NixOsSystemd,
+        Subject::System,
+        ObservationComponent::Configuration,
+        Presence::Present,
+        systemd_occurrence(2, 1, 7),
+    )
+    .unwrap();
+    let report = diagnose(input(vec![runtime, configuration_alias, configuration]));
+    assert_eq!(report.automations().len(), 1);
+    assert_eq!(
+        report.automations()[0]
+            .claims()
+            .configuration()
+            .provenance()
+            .evidence_ids()
+            .len(),
+        2
+    );
+    assert_eq!(
+        report.automations()[0]
+            .claims()
+            .runtime()
+            .provenance()
+            .evidence_ids()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn anonymous_source_occurrences_keep_multiplicity_and_present_selection() {
+    let first = ProviderEvidence::with_occurrence(
+        Provider::Cronie,
+        Subject::System,
+        ObservationComponent::Configuration,
+        Presence::Present,
+        anonymous_occurrence(3, 1, 0),
+    )
+    .unwrap();
+    let second = ProviderEvidence::with_occurrence(
+        Provider::Cronie,
+        Subject::System,
+        ObservationComponent::Configuration,
+        Presence::Present,
+        anonymous_occurrence(3, 2, 0),
+    )
+    .unwrap();
+    let absent = ProviderEvidence::with_occurrence(
+        Provider::Cronie,
+        Subject::System,
+        ObservationComponent::Runtime,
+        Presence::Absent,
+        anonymous_occurrence(3, 3, 0),
+    )
+    .unwrap();
+    let report = diagnose(input(vec![absent, second, first]));
+    assert_eq!(report.automations().len(), 2);
+    assert!(
+        report
+            .automations()
+            .iter()
+            .all(|automation| automation.provider() == Provider::Cronie)
+    );
+}
+
+#[test]
+fn inventory_order_is_subject_then_provider_catalog_order() {
+    let user_cronie = ProviderEvidence::with_occurrence(
+        Provider::Cronie,
+        Subject::Uid(1000),
+        ObservationComponent::Configuration,
+        Presence::Present,
+        anonymous_occurrence(4, 1, 0),
+    )
+    .unwrap();
+    let system_systemd = row(ObservationComponent::Configuration, Presence::Present);
+    let report = diagnose(
+        DiagnosticInput::new(
+            TargetPlatform::Linux,
+            ScanScope::Default,
+            ScanWindow::new(UNIX_EPOCH, Duration::from_secs(1)).unwrap(),
+            ProviderEvidenceSet::new(vec![user_cronie, system_systemd]).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(report.automations()[0].subject(), Subject::System);
+    assert_eq!(report.automations()[1].subject(), Subject::Uid(1000));
 }
