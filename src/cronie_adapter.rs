@@ -563,74 +563,131 @@ pub fn evidence_for_table(
     ordinal: u32,
     capture: u32,
 ) -> Result<Vec<ProviderEvidence>, InputError> {
-    let occurrence = DefinitionOccurrence::new(
-        ProviderLogicalKey::Anonymous,
-        SourceOccurrenceKey::new(SourceRoot::CronieTable(source_id), ordinal),
-        CaptureSequence::new(capture),
-    );
-    // LLM contract: every table result transitions its identity-only
-    // occurrence once to a Cronie shape. Present schedules are Known, while
-    // principals remain Unknown because account names are redacted; absent/
-    // empty values are Unknown and read failures are Unavailable.
-    let shape = match result {
-        CronieTableResult::Present(schedule) => DefinitionShape::Cronie {
-            schedule: ShapeState::Known(schedule.clone()),
-            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-        },
-        CronieTableResult::Absent | CronieTableResult::PresentEmpty => DefinitionShape::Cronie {
-            schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-        },
-        CronieTableResult::Unknown(_) => DefinitionShape::Cronie {
-            schedule: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
-            principal: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
-            command: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
-            context: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
-        },
-        CronieTableResult::Unavailable(reason) => DefinitionShape::Cronie {
-            schedule: ShapeState::Unavailable(*reason),
-            principal: ShapeState::Unavailable(*reason),
-            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-        },
+    let source_key_available = source_id != SourceRootId::new(0) && ordinal != 0;
+    let evidence_presence = if source_key_available {
+        result.presence()
+    } else {
+        Presence::Unavailable(UnavailableReason::MalformedEvidence)
     };
-    let occurrence = occurrence.with_shape(shape)?;
-    let mut rows = Vec::new();
-    for component in [
-        ObservationComponent::Configuration,
-        ObservationComponent::Schedule,
-    ] {
-        let row = ProviderEvidence::with_occurrence(
-            Provider::Cronie,
-            subject,
-            component,
-            result.presence(),
-            occurrence.clone(),
-        )?;
-        rows.push(match (component, result.schedule()) {
-            (ObservationComponent::Schedule, Some(schedule)) => {
-                row.with_schedule(Schedule::Cronie(schedule.clone()))?
-            }
-            _ => row,
-        });
-    }
-    for component in [
-        ObservationComponent::Runtime,
-        ObservationComponent::Activity,
-        ObservationComponent::Runs,
-        ObservationComponent::LastResult,
-    ] {
+    let source_occurrence = source_key_available.then(|| {
+        DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(SourceRoot::CronieTable(source_id), ordinal),
+            CaptureSequence::new(capture),
+        )
+    });
+    let Some(schedule) = result.schedule().filter(|_| source_key_available) else {
+        // LLM contract: Absent, PresentEmpty, Unknown, and Unavailable are
+        // evidence-only states. A valid source key is retained as an opaque
+        // discriminator for each evidence row, but only Present rows may
+        // become inventory candidates. A zero source id/ordinal is also
+        // unavailable; no state creates a synthetic definition or repairs it.
+        let mut rows = Vec::new();
+        for component in [
+            ObservationComponent::Configuration,
+            ObservationComponent::Schedule,
+        ] {
+            rows.push(match source_occurrence.as_ref() {
+                Some(occurrence) => ProviderEvidence::with_occurrence(
+                    Provider::Cronie,
+                    subject,
+                    component,
+                    evidence_presence,
+                    occurrence.clone(),
+                )?,
+                None => {
+                    ProviderEvidence::new(Provider::Cronie, subject, component, evidence_presence)?
+                }
+            });
+        }
+        for component in [
+            ObservationComponent::Runtime,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ] {
+            let presence = Presence::Unavailable(UnavailableReason::InterfaceUnavailable);
+            rows.push(match source_occurrence.as_ref() {
+                Some(occurrence) => ProviderEvidence::with_occurrence(
+                    Provider::Cronie,
+                    subject,
+                    component,
+                    presence,
+                    occurrence.clone(),
+                )?,
+                None => ProviderEvidence::new(Provider::Cronie, subject, component, presence)?,
+            });
+        }
+        return Ok(rows);
+    };
+
+    // LLM contract: one Present table transitions to one normalized
+    // occurrence per parsed entry, using deterministic source-local ordinals.
+    // Capture remains occurrence evidence; the later inventory seam decides
+    // whether to exclude it from logical identity. Account names and command
+    // bytes remain redacted, and this pure seam performs no I/O or scheduler action.
+    let mut rows = Vec::with_capacity(schedule.entries().len() * 7);
+    for (index, entry) in schedule.entries().iter().enumerate() {
+        let entry_schedule = CronieSchedule::new(
+            vec![entry.clone()],
+            schedule.timezone().cloned(),
+            schedule.random_delay_minutes(),
+        )
+        .map_err(|_| InputError::InvalidNormalizedValue)?;
+        let occurrence = DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(
+                SourceRoot::CronieTable(source_id),
+                ordinal
+                    .checked_add(index as u32)
+                    .ok_or(InputError::InvalidNormalizedValue)?,
+            ),
+            CaptureSequence::new(capture),
+        )
+        .with_shape(DefinitionShape::Cronie {
+            schedule: ShapeState::Known(entry_schedule.clone()),
+            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        })?;
+        for component in [
+            ObservationComponent::Configuration,
+            ObservationComponent::Schedule,
+        ] {
+            let row = ProviderEvidence::with_occurrence(
+                Provider::Cronie,
+                subject,
+                component,
+                Presence::Present,
+                occurrence.clone(),
+            )?;
+            rows.push(if component == ObservationComponent::Schedule {
+                row.with_schedule(Schedule::Cronie(entry_schedule.clone()))?
+            } else {
+                row
+            });
+        }
         rows.push(ProviderEvidence::with_occurrence(
             Provider::Cronie,
             subject,
-            component,
-            Presence::Unavailable(UnavailableReason::InterfaceUnavailable),
+            ObservationComponent::Command,
+            Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax),
             occurrence.clone(),
         )?);
+        for component in [
+            ObservationComponent::Runtime,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ] {
+            rows.push(ProviderEvidence::with_occurrence(
+                Provider::Cronie,
+                subject,
+                component,
+                Presence::Unavailable(UnavailableReason::InterfaceUnavailable),
+                occurrence.clone(),
+            )?);
+        }
     }
     Ok(rows)
 }
@@ -733,7 +790,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 7);
         assert!(rows.iter().any(|row| row.schedule().is_some()));
         assert!(
             rows.iter()
@@ -767,20 +824,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(
-            absent_rows
-                .iter()
-                .filter_map(|row| row.occurrence())
-                .all(|occurrence| {
-                    matches!(
-                        occurrence.shape(),
-                        Some(DefinitionShape::Cronie {
-                            schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                            ..
-                        })
-                    )
-                })
-        );
+        assert!(absent_rows.iter().all(|row| row.occurrence().is_some()));
         let unavailable_rows = evidence_for_table(
             &CronieTableResult::Unavailable(UnavailableReason::PermissionDenied),
             Subject::System,
@@ -792,18 +836,7 @@ mod tests {
         assert!(
             unavailable_rows
                 .iter()
-                .filter_map(|row| row.occurrence())
-                .all(|occurrence| {
-                    matches!(
-                        occurrence.shape(),
-                        Some(DefinitionShape::Cronie {
-                            schedule: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
-                            principal: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
-                            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                        })
-                    )
-                })
+                .all(|row| row.occurrence().is_some())
         );
         let unsupported = normalize_cronie_file(
             stat(12),
@@ -845,6 +878,7 @@ mod tests {
                 CronieTableResult::Unknown(ObservationUnknownReason::MalformedSyntax)
             );
         }
+
         for text in [
             b"0 0 0 1 * root /bin/true\n".as_slice(),
             b"0 0 1 0 * root /bin/true\n".as_slice(),
@@ -971,6 +1005,43 @@ mod tests {
                 CronieTableKind::System
             ));
         }
+    }
+
+    #[test]
+    fn present_table_keeps_one_occurrence_per_entry() {
+        let text = b"* * * * * root /bin/true\n* * * * * root /bin/true\n";
+        let result = normalize_cronie_file(
+            stat(text.len()),
+            text,
+            stat(text.len()),
+            CronieTableKind::System,
+            Some(0),
+        );
+        let rows =
+            evidence_for_table(&result, Subject::System, SourceRootId::new(9), 99, 4).unwrap();
+        let mut occurrences: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.occurrence())
+            .cloned()
+            .collect();
+        occurrences.sort();
+        occurrences.dedup();
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(
+            occurrences
+                .iter()
+                .map(|occurrence| occurrence.source().ordinal())
+                .collect::<Vec<_>>(),
+            vec![99, 100]
+        );
+        assert_eq!(rows.len(), 14);
+        assert!(format!("{rows:?}").contains("<opaque>"));
+        let missing_key =
+            evidence_for_table(&result, Subject::System, SourceRootId::new(9), 0, 4).unwrap();
+        assert!(missing_key.iter().all(|row| row.occurrence().is_none()));
+        assert!(missing_key.iter().take(2).all(|row| {
+            row.presence() == Presence::Unavailable(UnavailableReason::MalformedEvidence)
+        }));
     }
 
     #[cfg(unix)]

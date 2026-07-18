@@ -283,6 +283,9 @@ impl SourceOccurrenceKey {
     pub const fn root(&self) -> &SourceRoot {
         &self.root
     }
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
 }
 
 impl fmt::Debug for SourceOccurrenceKey {
