@@ -553,13 +553,14 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
         if tail.is_empty() {
             return Err(ObservationUnknownReason::MalformedSyntax);
         }
+        let fields = shortcut_calendar_fields(keyword)?;
+        let options = context.options.clone();
+        ensure_context_options(&options, FcronEntryKind::Calendar(fields.clone()))?;
         context.entries.push(FcronEntry::new(
-            FcronEntryKind::Periodic {
-                keyword,
-                fields: None,
-            },
-            context.options.clone(),
+            FcronEntryKind::Calendar(fields),
+            options.clone(),
         ));
+        update_timezone(context, options.options());
         return Ok(());
     }
     let (options, frequency_token, command) = if head.is_empty() {
@@ -609,12 +610,16 @@ fn parse_calendar_line(
     context: &mut ParseContext,
     allow_frequency: bool,
 ) -> Result<(), ObservationUnknownReason> {
+    // `&` accepts a glued numeric run-frequency (`&7 ...`); a separated
+    // number is the first cron minute field (`& 0 5 * * * ...`).  Keeping
+    // adjacency here preserves fcron's grammar without guessing from values.
+    let glued_frequency = allow_frequency && !rest.starts_with(char::is_whitespace);
     let rest = rest.trim_start();
     let mut tokens = rest.split_whitespace();
     let first = tokens
         .next()
         .ok_or(ObservationUnknownReason::MalformedSyntax)?;
-    let (local_options, frequency) = if allow_frequency && first.chars().all(|c| c.is_ascii_digit())
+    let (local_options, frequency) = if glued_frequency && first.chars().all(|c| c.is_ascii_digit())
     {
         let value = first
             .parse::<u32>()
@@ -623,7 +628,7 @@ fn parse_calendar_line(
             return Err(ObservationUnknownReason::UnsupportedSyntax);
         }
         (Vec::new(), Some(value))
-    } else if allow_frequency
+    } else if glued_frequency
         && first != "*"
         && !first.starts_with("*/")
         && (first.contains(',') || first.contains('(') || is_option_name(first))
@@ -632,11 +637,12 @@ fn parse_calendar_line(
     } else {
         (Vec::new(), None)
     };
-    let mut field_tokens = if !allow_frequency || first == "*" || first.starts_with("*/") {
-        vec![first]
-    } else {
-        Vec::new()
-    };
+    let mut field_tokens =
+        if !allow_frequency || !glued_frequency || first == "*" || first.starts_with("*/") {
+            vec![first]
+        } else {
+            Vec::new()
+        };
     field_tokens.extend(tokens);
     let mut field_tokens = field_tokens.into_iter();
     let mut fields = Vec::new();
@@ -814,6 +820,30 @@ fn shortcut_keyword(value: &str) -> Option<FcronPeriodicKeyword> {
         "annually" => FcronPeriodicKeyword::Annually,
         _ => return None,
     })
+}
+
+fn shortcut_calendar_fields(
+    keyword: FcronPeriodicKeyword,
+) -> Result<FcronCalendarFields, ObservationUnknownReason> {
+    let any = || {
+        FcronTimeField::new(vec![FcronFieldAtom::Any])
+            .map_err(|_| ObservationUnknownReason::MalformedSyntax)
+    };
+    let value = |value| {
+        FcronTimeField::new(vec![FcronFieldAtom::Value(value)])
+            .map_err(|_| ObservationUnknownReason::MalformedSyntax)
+    };
+    let fields = match keyword {
+        FcronPeriodicKeyword::Hourly => [value(0)?, any()?, any()?, any()?, any()?],
+        FcronPeriodicKeyword::Daily => [value(0)?, value(0)?, any()?, any()?, any()?],
+        FcronPeriodicKeyword::Weekly => [value(0)?, value(0)?, any()?, any()?, value(0)?],
+        FcronPeriodicKeyword::Monthly => [value(0)?, value(0)?, value(1)?, any()?, any()?],
+        FcronPeriodicKeyword::Yearly | FcronPeriodicKeyword::Annually => {
+            [value(0)?, value(0)?, value(1)?, value(1)?, any()?]
+        }
+        _ => return Err(ObservationUnknownReason::UnsupportedSyntax),
+    };
+    Ok(FcronCalendarFields::new(fields))
 }
 
 fn parse_options(value: &str) -> Result<Vec<FcronOption>, ObservationUnknownReason> {
@@ -1158,42 +1188,46 @@ fn parse_lavg(value: &str) -> Result<[Option<FcronLoadAverage>; 3], ObservationU
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
     for (index, part) in parts.into_iter().enumerate() {
-        let (whole, fraction) = part.split_once('.').unwrap_or((part, "0"));
-        if fraction.len() != 1 {
-            return Err(ObservationUnknownReason::MalformedSyntax);
-        }
-        let whole = if whole.is_empty() { "0" } else { whole }
-            .parse::<u16>()
-            .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
-        let fraction = fraction
-            .parse::<u16>()
-            .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
-        let tenths = whole
-            .checked_mul(10)
-            .and_then(|value| value.checked_add(fraction))
-            .filter(|value| *value <= 2_550)
-            .ok_or(ObservationUnknownReason::MalformedSyntax)?;
-        values[index] = Some(FcronLoadAverage::from_tenths(tenths));
+        values[index] = Some(parse_single_lavg(part)?);
     }
     Ok(values)
 }
 
 fn parse_single_lavg(value: &str) -> Result<FcronLoadAverage, ObservationUnknownReason> {
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, "0"));
-    if fraction.len() != 1 {
+    if value.is_empty() || value.len() > 32 || value.chars().any(char::is_control) {
+        return Err(ObservationUnknownReason::MalformedSyntax);
+    }
+    let has_decimal = value.contains('.');
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.contains('.') || whole.contains(|c: char| !c.is_ascii_digit()) {
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
     let whole = if whole.is_empty() { "0" } else { whole }
         .parse::<u16>()
         .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
-    let fraction = fraction
-        .parse::<u16>()
-        .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
-    let tenths = whole
+    if (has_decimal && fraction.is_empty()) || fraction.chars().any(|c| !c.is_ascii_digit()) {
+        return Err(ObservationUnknownReason::MalformedSyntax);
+    }
+    let mut tenths = whole
         .checked_mul(10)
-        .and_then(|value| value.checked_add(fraction))
-        .filter(|value| *value <= 2_550)
         .ok_or(ObservationUnknownReason::MalformedSyntax)?;
+    if let Some(first) = fraction.as_bytes().first() {
+        tenths = tenths
+            .checked_add(u16::from(first - b'0'))
+            .ok_or(ObservationUnknownReason::MalformedSyntax)?;
+        if fraction
+            .as_bytes()
+            .get(1)
+            .is_some_and(|digit| *digit >= b'5')
+        {
+            tenths = tenths
+                .checked_add(1)
+                .ok_or(ObservationUnknownReason::MalformedSyntax)?;
+        }
+    }
+    if tenths > 2_550 {
+        return Err(ObservationUnknownReason::MalformedSyntax);
+    }
     Ok(FcronLoadAverage::from_tenths(tenths))
 }
 
@@ -1647,6 +1681,37 @@ mod tests {
                     [FcronFieldAtom::Range { start: 0, end: 23, step: 2, excluded }] if excluded.is_empty()
                 )
         ));
+        let separated_ampersand = parse_fcron(
+            "& 05,35 12-14 * * * /bin/true\n",
+            FcronTableKind::UserSource,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            separated_ampersand.entries()[0].kind(),
+            FcronEntryKind::Calendar(fields)
+                if matches!(fields.fields()[0].atoms(), [FcronFieldAtom::Value(5), FcronFieldAtom::Value(35)])
+        ));
+        let glued_frequency = parse_fcron("&7 0 5 * * * /bin/true\n", FcronTableKind::UserSource)
+            .unwrap()
+            .unwrap();
+        assert!(
+            glued_frequency.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::RunFrequency(7)))
+        );
+        let vixie_daily = parse_fcron("@daily /bin/true\n", FcronTableKind::UserSource)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            vixie_daily.entries()[0].kind(),
+            FcronEntryKind::Calendar(fields)
+                if matches!(fields.fields()[0].atoms(), [FcronFieldAtom::Value(0)])
+                    && matches!(fields.fields()[1].atoms(), [FcronFieldAtom::Value(0)])
+                    && matches!(fields.fields()[2].atoms(), [FcronFieldAtom::Any])
+        ));
         for line in [
             b"@reboot /bin/true\n".as_slice(),
             b"@resume /bin/true\n".as_slice(),
@@ -1718,6 +1783,21 @@ mod tests {
         assert!(schedule.options().options().iter().any(|option| matches!(
             option,
             FcronOption::LavgOne { slot: 15, value } if value.tenths() == 2_550
+        )));
+        let rounded = parse_fcron(
+            "!lavg(0.95,1.04,1.55)\n@daily /bin/true\n",
+            FcronTableKind::UserSource,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(rounded.options().options().iter().any(|option| matches!(
+            option,
+            FcronOption::Lavg(values)
+                if values == &[
+                    Some(FcronLoadAverage::from_tenths(10)),
+                    Some(FcronLoadAverage::from_tenths(10)),
+                    Some(FcronLoadAverage::from_tenths(16)),
+                ]
         )));
         let rows = fcron_evidence_for_table(
             &FcronTableResult::PresentEmpty,
