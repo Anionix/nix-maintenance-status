@@ -1,8 +1,8 @@
 use crate::evidence::{
-    AnacronJobId, AnacronStateNamespace, CaptureSequence, DefinitionOccurrence, InputError,
-    ObservationComponent, ObservationUnknownReason, Presence, Provider, ProviderEvidence,
-    ProviderEvidenceSet, ProviderLogicalKey, SourceOccurrenceKey, SourceRoot, SourceRootId,
-    Subject, UnavailableReason,
+    AnacronJobId, AnacronStateNamespace, CaptureSequence, DefinitionOccurrence, DefinitionShape,
+    InputError, ObservationComponent, ObservationUnknownReason, Presence, Provider,
+    ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, ShapeState, ShapeUnknownReason,
+    SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
 };
 use crate::report::{AnacronPeriod, AnacronSchedule, AnacronTimeZone, Schedule};
 #[cfg(unix)]
@@ -373,7 +373,12 @@ pub fn normalize_anacron_snapshot(
             },
             SourceOccurrenceKey::new(SourceRoot::AnacronTable(source), index as u32 + 1),
             capture.clone(),
-        );
+        )
+        .with_shape(DefinitionShape::Anacron {
+            schedule: ShapeState::Known(job.schedule.clone()),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        })?;
         let config = ProviderEvidence::with_occurrence(
             Provider::Anacron,
             subject,
@@ -690,6 +695,14 @@ mod tests {
         let report = input(AnacronTableProbe::fixture(
             b"SHELL = /bin/sh\nPATH = /bin\nMAILFROM = root@example\nNO_MAIL_OUTPUT=yes\nSTART_HOURS_RANGE = 6-22\nRANDOM_DELAY = 15\n@daily 5 nix-gc command=private \\\n /nix/store/gc\n",
         ));
+        assert!(
+            report
+                .evidence()
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.occurrence())
+                .all(|occurrence| occurrence.shape().is_some())
+        );
         let Schedule::Anacron(schedule) = report.evidence().entries()[1].schedule().unwrap() else {
             panic!()
         };

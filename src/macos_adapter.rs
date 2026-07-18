@@ -3,7 +3,7 @@ use nix_maintenance_status::{
     LaunchdDomain, LaunchdLabel, LaunchdSchedule, ObservationComponent, Presence, Provider,
     ProviderEvidence, ProviderEvidenceSet, ProviderLogicalKey, ScanScope, ScanWindow, Schedule,
     ScheduleError, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, TargetPlatform,
-    UnavailableReason,
+    UnavailableReason, with_launchd_shape,
 };
 
 const EXPECTED_JOB_HEADING: &str = "system/org.nixos.nix-gc = {";
@@ -93,7 +93,7 @@ fn launchd_occurrence() -> DefinitionOccurrence {
 
 pub(crate) fn diagnostic_input() -> Result<DiagnosticInput, InputError> {
     let started = std::time::SystemTime::now();
-    let occurrence = launchd_occurrence();
+    let occurrence = with_launchd_shape(launchd_occurrence(), None)?;
     let evidence = ProviderEvidenceSet::new(vec![
         ProviderEvidence::with_occurrence(
             Provider::NixDarwinLaunchd,

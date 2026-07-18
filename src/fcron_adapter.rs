@@ -18,9 +18,10 @@ use crate::catalog::{
 #[cfg(test)]
 use crate::catalog::{CatalogScope, ObservedPackageIdentity};
 use crate::evidence::{
-    CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent,
+    CaptureSequence, DefinitionOccurrence, DefinitionShape, InputError, ObservationComponent,
     ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
-    ProviderLogicalKey, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
+    ProviderLogicalKey, ShapeState, ShapeUnknownReason, SourceOccurrenceKey, SourceRoot,
+    SourceRootId, Subject, UnavailableReason,
 };
 use crate::report::{
     FcronCalendarFields, FcronEntry, FcronEntryKind, FcronFieldAtom, FcronLoadAverage, FcronOption,
@@ -1618,13 +1619,22 @@ fn fcron_evidence_for_table_with_resolved_authority(
     capture: u32,
     scheduler_authority: AuthorityResolution,
 ) -> Result<Vec<ProviderEvidence>, InputError> {
-    let occurrence = result.schedule().map(|_| {
-        DefinitionOccurrence::new(
-            ProviderLogicalKey::Anonymous,
-            SourceOccurrenceKey::new(SourceRoot::FcronTable(source_id), ordinal),
-            CaptureSequence::new(capture),
+    let occurrence = if let Some(schedule) = result.schedule() {
+        Some(
+            DefinitionOccurrence::new(
+                ProviderLogicalKey::Anonymous,
+                SourceOccurrenceKey::new(SourceRoot::FcronTable(source_id), ordinal),
+                CaptureSequence::new(capture),
+            )
+            .with_shape(DefinitionShape::Fcron {
+                schedule: ShapeState::Known(schedule.clone()),
+                command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            })?,
         )
-    });
+    } else {
+        None
+    };
     let mut rows = Vec::new();
     for component in [
         ObservationComponent::Configuration,
@@ -1868,6 +1878,18 @@ mod tests {
             rows[1].authority(AuthorityRole::SchedulerSemantics),
             AuthorityResolution::Unresolved(_)
         ));
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.occurrence())
+                .all(|occurrence| matches!(
+                    occurrence.shape(),
+                    Some(DefinitionShape::Fcron {
+                        schedule: ShapeState::Known(_),
+                        command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                        context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                    })
+                ))
+        );
         let rows = fcron_evidence_for_table_with_authority(
             &result,
             Subject::uid(1000),

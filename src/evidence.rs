@@ -543,6 +543,34 @@ impl DefinitionOccurrence {
     }
 }
 
+/// Attach a launchd-native shape from already-normalized evidence.
+/// LLM contract: one identity-only occurrence transitions once; absent schedule
+/// stays Unknown and no raw plist, command, process, or I/O crosses this seam.
+pub fn with_launchd_shape(
+    occurrence: DefinitionOccurrence,
+    schedule: Option<LaunchdSchedule>,
+) -> Result<DefinitionOccurrence, InputError> {
+    let context = match occurrence.logical_key() {
+        ProviderLogicalKey::Launchd {
+            domain: LaunchdDomain::System,
+            ..
+        } => ExecutionContext::System,
+        ProviderLogicalKey::Launchd {
+            domain: LaunchdDomain::User,
+            ..
+        } => ExecutionContext::User,
+        _ => return Err(InputError::InvalidDefinitionOccurrence),
+    };
+    occurrence.with_shape(DefinitionShape::Launchd {
+        schedule: schedule.map_or(
+            ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            ShapeState::Known,
+        ),
+        command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        context: ShapeState::Known(context),
+    })
+}
+
 impl PartialEq for DefinitionOccurrence {
     fn eq(&self, other: &Self) -> bool {
         self.logical_key == other.logical_key
@@ -1258,6 +1286,24 @@ mod tests {
         };
         assert!(!incomplete.is_fully_known());
         assert!(!incomplete.known_equal(&incomplete));
+
+        let user_occurrence = DefinitionOccurrence::new(
+            ProviderLogicalKey::Launchd {
+                domain: LaunchdDomain::User,
+                subject: Subject::Uid(1000),
+                label: LaunchdLabel::new("org.nix.gc.user").unwrap(),
+            },
+            SourceOccurrenceKey::new(SourceRoot::LaunchdPlist(SourceRootId::new(1)), 4),
+            CaptureSequence::new(2),
+        );
+        let user_launchd = with_launchd_shape(user_occurrence, None).unwrap();
+        assert!(matches!(
+            user_launchd.shape(),
+            Some(DefinitionShape::Launchd {
+                context: ShapeState::Known(ExecutionContext::User),
+                ..
+            })
+        ));
 
         let fcron_shape = DefinitionShape::Fcron {
             schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),

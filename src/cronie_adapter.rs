@@ -2,9 +2,9 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use crate::evidence::{
-    CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent,
-    ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderLogicalKey,
-    SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
+    CaptureSequence, DefinitionOccurrence, DefinitionShape, InputError, ObservationComponent,
+    ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderLogicalKey, ShapeState,
+    ShapeUnknownReason, SourceOccurrenceKey, SourceRoot, SourceRootId, Subject, UnavailableReason,
 };
 use crate::report::{
     CronieCommand, CronieEntry, CronieFieldAtom, CronieSchedule, CronieTimeField, CronieUserField,
@@ -568,6 +568,37 @@ pub fn evidence_for_table(
         SourceOccurrenceKey::new(SourceRoot::CronieTable(source_id), ordinal),
         CaptureSequence::new(capture),
     );
+    // LLM contract: every table result transitions its identity-only
+    // occurrence once to a Cronie shape. Present schedules are Known, while
+    // principals remain Unknown because account names are redacted; absent/
+    // empty values are Unknown and read failures are Unavailable.
+    let shape = match result {
+        CronieTableResult::Present(schedule) => DefinitionShape::Cronie {
+            schedule: ShapeState::Known(schedule.clone()),
+            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        },
+        CronieTableResult::Absent | CronieTableResult::PresentEmpty => DefinitionShape::Cronie {
+            schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        },
+        CronieTableResult::Unknown(_) => DefinitionShape::Cronie {
+            schedule: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
+            principal: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
+            command: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
+            context: ShapeState::Unknown(ShapeUnknownReason::Unsupported),
+        },
+        CronieTableResult::Unavailable(reason) => DefinitionShape::Cronie {
+            schedule: ShapeState::Unavailable(*reason),
+            principal: ShapeState::Unavailable(*reason),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        },
+    };
+    let occurrence = occurrence.with_shape(shape)?;
     let mut rows = Vec::new();
     for component in [
         ObservationComponent::Configuration,
@@ -704,6 +735,17 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 6);
         assert!(rows.iter().any(|row| row.schedule().is_some()));
+        assert!(
+            rows.iter()
+                .filter_map(|row| row.occurrence())
+                .all(|occurrence| matches!(
+                    occurrence.shape(),
+                    Some(DefinitionShape::Cronie {
+                        principal: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                        ..
+                    })
+                ))
+        );
     }
 
     #[test]
@@ -717,6 +759,52 @@ mod tests {
         );
         assert_eq!(empty, CronieTableResult::PresentEmpty);
         assert_eq!(CronieTableResult::Absent.presence(), Presence::Absent);
+        let absent_rows = evidence_for_table(
+            &CronieTableResult::Absent,
+            Subject::System,
+            SourceRootId::new(1),
+            2,
+            0,
+        )
+        .unwrap();
+        assert!(
+            absent_rows
+                .iter()
+                .filter_map(|row| row.occurrence())
+                .all(|occurrence| {
+                    matches!(
+                        occurrence.shape(),
+                        Some(DefinitionShape::Cronie {
+                            schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                            ..
+                        })
+                    )
+                })
+        );
+        let unavailable_rows = evidence_for_table(
+            &CronieTableResult::Unavailable(UnavailableReason::PermissionDenied),
+            Subject::System,
+            SourceRootId::new(1),
+            3,
+            0,
+        )
+        .unwrap();
+        assert!(
+            unavailable_rows
+                .iter()
+                .filter_map(|row| row.occurrence())
+                .all(|occurrence| {
+                    matches!(
+                        occurrence.shape(),
+                        Some(DefinitionShape::Cronie {
+                            schedule: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
+                            principal: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
+                            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+                        })
+                    )
+                })
+        );
         let unsupported = normalize_cronie_file(
             stat(12),
             b"@daily true\n",
