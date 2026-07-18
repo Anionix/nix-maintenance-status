@@ -1,5 +1,8 @@
 mod macos_adapter;
 
+use error_stack::ResultExt as _;
+use rancor::ResultExt as _;
+
 use nix_maintenance_status::{
     Claim, Conclusion, ConsistencyValue, CoverageAggregate, EvidenceClass, GcReport,
     ObservationValue, Provider, diagnose,
@@ -31,7 +34,7 @@ fn main() {
         }
         let input = match normalized_macos_input() {
             Ok(input) => input,
-            Err(_) => {
+            Err(_report) => {
                 eprintln!("error: macOS evidence could not be normalized");
                 std::process::exit(2);
             }
@@ -51,8 +54,17 @@ fn main() {
     std::process::exit(2);
 }
 
-fn normalized_macos_input() -> anyhow::Result<nix_maintenance_status::DiagnosticInput> {
-    macos_adapter::diagnostic_input().map_err(anyhow::Error::new)
+#[derive(Debug, thiserror::Error)]
+#[error("macOS evidence could not be normalized")]
+struct NormalizeMacOsEvidence;
+
+// The CLI adds fixed context but never emits source diagnostics. Library
+// callers retain the stable typed InputError contract and no raw probe data.
+fn normalized_macos_input()
+-> Result<nix_maintenance_status::DiagnosticInput, error_stack::Report<NormalizeMacOsEvidence>> {
+    macos_adapter::diagnostic_input()
+        .into_trace::<rancor::BoxedError, _>("normalizing macOS evidence")
+        .change_context(NormalizeMacOsEvidence)
 }
 
 fn presence_text(claim: Option<&Claim<ObservationValue>>) -> (&'static str, EvidenceClass) {
