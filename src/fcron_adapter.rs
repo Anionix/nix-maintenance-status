@@ -1,4 +1,4 @@
-//! Read-only normalization of fcron 3.4.0 source tables.
+//! Read-only normalization of fcron 3.4.0 and 3.4.1 source tables.
 //!
 //! The daemon's human-readable source is `<user>.orig` (or the explicitly
 //! configured `systab.orig`).  fcron itself ignores dotted files at runtime;
@@ -9,12 +9,12 @@ use std::ffi::CString;
 use std::io::{self, Read};
 use std::{fmt, path::Path, sync::Arc};
 
-#[cfg(test)]
-use crate::catalog::ObservedPackageIdentity;
 use crate::catalog::{
     AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, ObservedAuthorityIdentity,
     PackageIdentityObservation, ProviderCatalog,
 };
+#[cfg(test)]
+use crate::catalog::{CatalogScope, ObservedPackageIdentity};
 use crate::evidence::{
     CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent,
     ObservationUnknownReason, Presence, Provider, ProviderEvidence, ProviderEvidenceSet,
@@ -144,6 +144,7 @@ fn validate_component(value: &str) -> Result<(), FcronPathError> {
         || value.len() > 128
         || value == "."
         || value == ".."
+        || value == "systab"
         || value.contains('/')
         || value.contains('\\')
         || value.chars().any(char::is_control)
@@ -205,6 +206,21 @@ pub enum FcronTableResult {
     Unavailable(UnavailableReason),
 }
 
+/// A source result branded with the fcron 3.4.1 parser contract. The brand
+/// prevents evidence code from relabelling a 3.4.1 parse as 3.4.0 authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fcron341TableResult(FcronTableResult);
+
+impl Fcron341TableResult {
+    fn raw_state(&self) -> &FcronTableResult {
+        &self.0
+    }
+
+    pub const fn presence(&self) -> Presence {
+        self.0.presence()
+    }
+}
+
 impl FcronTableResult {
     // LLM contract: this total projection preserves the five source states
     // one-for-one. Absent and PresentEmpty remain known structural facts;
@@ -243,6 +259,24 @@ pub fn normalize_fcron_file(
     kind: FcronTableKind,
     expected_owner: Option<u32>,
 ) -> FcronTableResult {
+    normalize_fcron_file_with_contract(
+        before,
+        bytes,
+        after,
+        kind,
+        expected_owner,
+        FcronContractVersion::V3_4_0,
+    )
+}
+
+fn normalize_fcron_file_with_contract(
+    before: FcronFileStat,
+    bytes: &[u8],
+    after: FcronFileStat,
+    kind: FcronTableKind,
+    expected_owner: Option<u32>,
+    contract: FcronContractVersion,
+) -> FcronTableResult {
     if bytes.len() > MAX_FCRON_BYTES {
         return FcronTableResult::Unavailable(UnavailableReason::ResourceLimitExceeded);
     }
@@ -264,11 +298,40 @@ pub fn normalize_fcron_file(
         Ok(value) => value,
         Err(_) => return FcronTableResult::Unavailable(UnavailableReason::UnsupportedEncoding),
     };
-    match parse_fcron(text, kind) {
+    match parse_fcron_with_contract(text, kind, contract) {
         Ok(None) => FcronTableResult::PresentEmpty,
         Ok(Some(schedule)) => FcronTableResult::Present(schedule),
         Err(reason) => FcronTableResult::Unknown(reason),
     }
+}
+
+/// Normalize a fcron 3.4.1 source table. The versioned seam is explicit
+/// because upstream changed command-tail acceptance; schedule fields remain
+/// shared only after this policy-bound parser has validated the input.
+// LLM contract: V3_4_1 maps one bounded byte observation to exactly one of
+// PresentEmpty, Present, Unknown, or Unavailable. Absent is produced only by
+// the read seam. It never upgrades a failure, retains command bytes, performs
+// I/O, or infers runtime state.
+pub fn normalize_fcron_3_4_1_file(
+    before: FcronFileStat,
+    bytes: &[u8],
+    after: FcronFileStat,
+    kind: FcronTableKind,
+    expected_owner: Option<u32>,
+) -> Fcron341TableResult {
+    if kind != FcronTableKind::UserSource {
+        return Fcron341TableResult(FcronTableResult::Unavailable(
+            UnavailableReason::UnsafeObjectType,
+        ));
+    }
+    Fcron341TableResult(normalize_fcron_file_with_contract(
+        before,
+        bytes,
+        after,
+        kind,
+        expected_owner,
+        FcronContractVersion::V3_4_1,
+    ))
 }
 
 /// Read only an explicitly selected source table.  The caller must obtain the
@@ -281,7 +344,39 @@ pub fn read_fcron_source(
     source: &FcronSourcePath,
     expected_owner: Option<u32>,
 ) -> FcronTableResult {
-    read_fcron_file_inner(&source.root, &source.basename, source.kind, expected_owner)
+    read_fcron_file_inner(
+        &source.root,
+        &source.basename,
+        source.kind,
+        expected_owner,
+        FcronContractVersion::V3_4_0,
+    )
+}
+
+/// Read only a selected fcron 3.4.1 user source table. System `systab.orig`
+/// is deliberately rejected until a version-specific authority and scope are
+/// specified; no user enumeration or privilege transition is attempted.
+// LLM contract: the selected user `.orig` path yields Absent, PresentEmpty,
+// Present, Unknown, or Unavailable after one bounded read. System sources are
+// always UnsafeObjectType; no state is upgraded, and no mutation, command,
+// network, NSS, or privilege transition occurs.
+#[cfg(unix)]
+pub fn read_fcron_3_4_1_source(
+    source: &FcronSourcePath,
+    expected_owner: Option<u32>,
+) -> Fcron341TableResult {
+    if source.kind() != FcronTableKind::UserSource {
+        return Fcron341TableResult(FcronTableResult::Unavailable(
+            UnavailableReason::UnsafeObjectType,
+        ));
+    }
+    Fcron341TableResult(read_fcron_file_inner(
+        &source.root,
+        &source.basename,
+        source.kind,
+        expected_owner,
+        FcronContractVersion::V3_4_1,
+    ))
 }
 
 #[cfg(unix)]
@@ -309,6 +404,7 @@ fn read_fcron_file_inner(
     basename: &str,
     kind: FcronTableKind,
     expected_owner: Option<u32>,
+    contract: FcronContractVersion,
 ) -> FcronTableResult {
     let file = match open_fcron_leaf(root, basename) {
         Ok(file) => file,
@@ -340,7 +436,7 @@ fn read_fcron_file_inner(
         Ok(metadata) => stat_from_metadata(&metadata),
         Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
     };
-    normalize_fcron_file(before, &bytes, after, kind, expected_owner)
+    normalize_fcron_file_with_contract(before, &bytes, after, kind, expected_owner, contract)
 }
 
 #[cfg(unix)]
@@ -431,9 +527,24 @@ struct ParseContext {
     entries: Vec<FcronEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FcronContractVersion {
+    V3_4_0,
+    V3_4_1,
+}
+
+#[cfg(test)]
 fn parse_fcron(
     text: &str,
     kind: FcronTableKind,
+) -> Result<Option<FcronSchedule>, ObservationUnknownReason> {
+    parse_fcron_with_contract(text, kind, FcronContractVersion::V3_4_0)
+}
+
+fn parse_fcron_with_contract(
+    text: &str,
+    kind: FcronTableKind,
+    contract: FcronContractVersion,
 ) -> Result<Option<FcronSchedule>, ObservationUnknownReason> {
     let mut context = ParseContext {
         options: FcronOptionSet::default(),
@@ -441,7 +552,7 @@ fn parse_fcron(
         entries: Vec::new(),
     };
     for line in logical_lines(text)? {
-        parse_line(&line, &mut context)?;
+        parse_line(&line, &mut context, contract)?;
         let limit = match kind {
             FcronTableKind::UserSource => MAX_FCRON_USER_ENTRIES,
             FcronTableKind::SystemSource => MAX_FCRON_SYSTEM_ENTRIES,
@@ -485,7 +596,11 @@ fn logical_lines(text: &str) -> Result<Vec<String>, ObservationUnknownReason> {
     Ok(lines)
 }
 
-fn parse_line(line: &str, context: &mut ParseContext) -> Result<(), ObservationUnknownReason> {
+fn parse_line(
+    line: &str,
+    context: &mut ParseContext,
+    contract: FcronContractVersion,
+) -> Result<(), ObservationUnknownReason> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return Ok(());
@@ -513,10 +628,12 @@ fn parse_line(line: &str, context: &mut ParseContext) -> Result<(), ObservationU
     // A command is opaque to this adapter and may contain `=`. Dispatch
     // schedule-leading lines before considering environment assignments.
     match line.as_bytes().first().copied() {
-        Some(b'@') => return parse_at_line(&line[1..], context),
-        Some(b'&') => return parse_calendar_line(&line[1..], context, true),
-        Some(b'%') => return parse_periodic_line(&line[1..], context),
-        Some(b'0'..=b'9') | Some(b'*') => return parse_calendar_line(line, context, false),
+        Some(b'@') => return parse_at_line(&line[1..], context, contract),
+        Some(b'&') => return parse_calendar_line(&line[1..], context, true, contract),
+        Some(b'%') => return parse_periodic_line(&line[1..], context, contract),
+        Some(b'0'..=b'9') | Some(b'*') => {
+            return parse_calendar_line(line, context, false, contract);
+        }
         _ => {}
     }
     if let Some((name, value)) = line.split_once('=') {
@@ -532,7 +649,11 @@ fn parse_line(line: &str, context: &mut ParseContext) -> Result<(), ObservationU
     Err(ObservationUnknownReason::UnsupportedSyntax)
 }
 
-fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), ObservationUnknownReason> {
+fn parse_at_line(
+    rest: &str,
+    context: &mut ParseContext,
+    contract: FcronContractVersion,
+) -> Result<(), ObservationUnknownReason> {
     let rest = rest.trim_start();
     let mut fields = rest.splitn(2, char::is_whitespace);
     let head = fields.next().unwrap_or("");
@@ -541,6 +662,7 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
         if tail.is_empty() {
             return Err(ObservationUnknownReason::MalformedSyntax);
         }
+        validate_command_tail(tail, contract)?;
         context.entries.push(FcronEntry::new(
             FcronEntryKind::Reboot {
                 resume: head == "resume",
@@ -553,6 +675,7 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
         if tail.is_empty() {
             return Err(ObservationUnknownReason::MalformedSyntax);
         }
+        validate_command_tail(tail, contract)?;
         let fields = shortcut_calendar_fields(keyword)?;
         let options = context.options.clone();
         ensure_context_options(&options, FcronEntryKind::Calendar(fields.clone()))?;
@@ -592,6 +715,7 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
     if command.is_empty() {
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
+    validate_command_tail(command, contract)?;
     let frequency = parse_time_value(frequency_token)?;
     if frequency.seconds() == 0 {
         return Err(ObservationUnknownReason::MalformedSyntax);
@@ -605,10 +729,33 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
     Ok(())
 }
 
+fn validate_command_tail(
+    command: &str,
+    contract: FcronContractVersion,
+) -> Result<(), ObservationUnknownReason> {
+    let command = command.trim_end();
+    if command.is_empty() {
+        return Err(ObservationUnknownReason::MalformedSyntax);
+    }
+    if matches!(contract, FcronContractVersion::V3_4_0)
+        && let Some(quote) = command.as_bytes().first().copied()
+        && (quote == b'\'' || quote == b'"')
+    {
+        if command.as_bytes().last().copied() != Some(quote) {
+            return Err(ObservationUnknownReason::MalformedSyntax);
+        }
+        if command.len() < 2 || command[1..command.len() - 1].is_empty() {
+            return Err(ObservationUnknownReason::MalformedSyntax);
+        }
+    }
+    Ok(())
+}
+
 fn parse_calendar_line(
     rest: &str,
     context: &mut ParseContext,
     allow_frequency: bool,
+    contract: FcronContractVersion,
 ) -> Result<(), ObservationUnknownReason> {
     // `&` accepts a glued numeric run-frequency (`&7 ...`); a separated
     // number is the first cron minute field (`& 0 5 * * * ...`).  Keeping
@@ -665,9 +812,11 @@ fn parse_calendar_line(
         );
         let _ = index;
     }
-    if field_tokens.next().is_none() {
+    let command = field_tokens.collect::<Vec<_>>().join(" ");
+    if command.is_empty() {
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
+    validate_command_tail(&command, contract)?;
     let fields: [FcronTimeField; 5] = fields.try_into().expect("five calendar fields");
     let mut options = context.options.merge(&local_options);
     if let Some(frequency) = frequency {
@@ -688,6 +837,7 @@ fn parse_calendar_line(
 fn parse_periodic_line(
     rest: &str,
     context: &mut ParseContext,
+    contract: FcronContractVersion,
 ) -> Result<(), ObservationUnknownReason> {
     let rest = rest.trim_start();
     let mut tokens = rest.split_whitespace();
@@ -735,6 +885,7 @@ fn parse_periodic_line(
     if remaining.len() <= field_count {
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
+    validate_command_tail(&remaining[field_count..].join(" "), contract)?;
     let mut fields = Vec::new();
     for (index, (min, max, names)) in ranges.into_iter().enumerate() {
         if index < field_count {
@@ -1365,10 +1516,37 @@ pub fn fcron_3_4_0_contract_observation() -> AuthorityIdentityObservation {
     }
 }
 
+/// Build the exact fcron 3.4.1 ContractPin. It is intentionally independent
+/// from 3.4.0 even though the normalized schedule projection is shared after
+/// the version-specific parser policy has run.
+pub fn fcron_3_4_1_contract_observation() -> AuthorityIdentityObservation {
+    let identity = ObservedAuthorityIdentity::contract_with_fingerprint(
+        "yo8192/fcron",
+        "a9c1590d9bf8b3ab3b13bba1d2777c7eb3ea6130",
+        "doc/en/fcrontab.5.sgml",
+        Some("3.4.1"),
+        None,
+        Some("fcron-3.4.1-v1"),
+    );
+    match identity {
+        Ok(identity) => AuthorityIdentityObservation::Known(identity),
+        Err(_) => AuthorityIdentityObservation::Malformed,
+    }
+}
+
 /// Resolve scheduler semantics only when both version/package evidence and the
 /// exact ContractPin are observed. Unknown or mismatched inputs remain
 /// Unresolved; this function never treats a hard-coded revision as observed.
 pub fn resolve_fcron_3_4_0_authority(
+    package: &PackageIdentityObservation,
+    contract: &AuthorityIdentityObservation,
+) -> AuthorityResolution {
+    ProviderCatalog::embedded().resolve_cron_scheduler_semantics(Provider::Fcron, package, contract)
+}
+
+/// Resolve 3.4.1 only from the exact package observation and versioned
+/// ContractPin. No 3.4.0 authority is borrowed when the package is unknown.
+pub fn resolve_fcron_3_4_1_authority(
     package: &PackageIdentityObservation,
     contract: &AuthorityIdentityObservation,
 ) -> AuthorityResolution {
@@ -1415,6 +1593,24 @@ pub fn fcron_evidence_for_table_with_authority(
     contract: &AuthorityIdentityObservation,
 ) -> Result<Vec<ProviderEvidence>, InputError> {
     let scheduler_authority = resolve_fcron_3_4_0_authority(package, contract);
+    fcron_evidence_for_table_with_resolved_authority(
+        result,
+        subject,
+        source_id,
+        ordinal,
+        capture,
+        scheduler_authority,
+    )
+}
+
+fn fcron_evidence_for_table_with_resolved_authority(
+    result: &FcronTableResult,
+    subject: Subject,
+    source_id: SourceRootId,
+    ordinal: u32,
+    capture: u32,
+    scheduler_authority: AuthorityResolution,
+) -> Result<Vec<ProviderEvidence>, InputError> {
     let occurrence = result.schedule().map(|_| {
         DefinitionOccurrence::new(
             ProviderLogicalKey::Anonymous,
@@ -1468,6 +1664,49 @@ pub fn fcron_evidence_for_table_with_authority(
         });
     }
     Ok(rows)
+}
+
+pub fn fcron_3_4_1_evidence_for_table(
+    result: &Fcron341TableResult,
+    subject: Subject,
+    source_id: SourceRootId,
+    ordinal: u32,
+    capture: u32,
+) -> Result<Vec<ProviderEvidence>, InputError> {
+    fcron_3_4_1_evidence_for_table_with_authority(
+        result,
+        subject,
+        source_id,
+        ordinal,
+        capture,
+        &PackageIdentityObservation::Unavailable,
+        &AuthorityIdentityObservation::Unavailable,
+    )
+}
+
+// LLM contract: only the private-branded V3_4_1 result can enter this seam.
+// Authority is Resolved only when exact package and ContractPin evidence both
+// match; otherwise it remains Unresolved. Source rows preserve configuration
+// presence, keep runtime-like claims Unknown, leave AutomationMapping
+// NotClaimed, and never retain commands or perform I/O.
+pub fn fcron_3_4_1_evidence_for_table_with_authority(
+    result: &Fcron341TableResult,
+    subject: Subject,
+    source_id: SourceRootId,
+    ordinal: u32,
+    capture: u32,
+    package: &PackageIdentityObservation,
+    contract: &AuthorityIdentityObservation,
+) -> Result<Vec<ProviderEvidence>, InputError> {
+    let scheduler_authority = resolve_fcron_3_4_1_authority(package, contract);
+    fcron_evidence_for_table_with_resolved_authority(
+        result.raw_state(),
+        subject,
+        source_id,
+        ordinal,
+        capture,
+        scheduler_authority,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1628,7 +1867,7 @@ mod tests {
             SourceRootId::new(1),
             1,
             0,
-            &PackageIdentityObservation::Known(package),
+            &PackageIdentityObservation::Known(package.clone()),
             &fcron_3_4_0_contract_observation(),
         )
         .unwrap();
@@ -1645,6 +1884,209 @@ mod tests {
                 .all(|row| row.component() != ObservationComponent::Runtime
                     || matches!(row.presence(), Presence::Unknown(_)))
         );
+        assert!(matches!(
+            resolve_fcron_3_4_1_authority(
+                &PackageIdentityObservation::Known(package),
+                &fcron_3_4_1_contract_observation(),
+            ),
+            AuthorityResolution::Unresolved(_)
+        ));
+        assert!(matches!(
+            ProviderCatalog::embedded().resolve_observation(
+                AuthorityRole::SchedulerSemantics,
+                CatalogScope::Provider(Provider::Fcron),
+                &fcron_3_4_1_contract_observation(),
+            ),
+            AuthorityResolution::Resolved(entry)
+                if entry.entry_id().as_str() == "fcron.v3.4.1.scheduler.v1"
+        ));
+    }
+
+    #[test]
+    fn fcron_341_changes_only_quoted_command_acceptance() {
+        let quoted_with_args = include_bytes!("../tests/fixtures/fcron/3.4.1/quoted-command.orig");
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(quoted_with_args.len()),
+                quoted_with_args,
+                stat(quoted_with_args.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::MalformedSyntax)
+        ));
+        let observed = normalize_fcron_3_4_1_file(
+            stat(quoted_with_args.len()),
+            quoted_with_args,
+            stat(quoted_with_args.len()),
+            FcronTableKind::UserSource,
+            Some(1000),
+        );
+        assert!(matches!(observed.raw_state(), FcronTableResult::Present(_)));
+        assert!(!format!("{:?}", observed).contains("echo"));
+        let empty = b"# no entries\n";
+        assert_eq!(
+            normalize_fcron_3_4_1_file(
+                stat(empty.len()),
+                empty,
+                stat(empty.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            Fcron341TableResult(FcronTableResult::PresentEmpty)
+        );
+        let malformed = b"@daily\n";
+        assert!(matches!(
+            normalize_fcron_3_4_1_file(
+                stat(malformed.len()),
+                malformed,
+                stat(malformed.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            Fcron341TableResult(FcronTableResult::Unknown(_))
+        ));
+        for malformed in [b"@daily\n".as_slice(), b"%daily\n".as_slice()] {
+            let old = normalize_fcron_file(
+                stat(malformed.len()),
+                malformed,
+                stat(malformed.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            );
+            let new = normalize_fcron_3_4_1_file(
+                stat(malformed.len()),
+                malformed,
+                stat(malformed.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            );
+            assert_eq!(old.presence(), new.presence());
+        }
+        let empty_quoted = b"@daily \"\"\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(empty_quoted.len()),
+                empty_quoted,
+                stat(empty_quoted.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::MalformedSyntax)
+        ));
+        assert!(matches!(
+            normalize_fcron_3_4_1_file(
+                stat(empty_quoted.len()),
+                empty_quoted,
+                stat(empty_quoted.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            Fcron341TableResult(FcronTableResult::Present(_))
+        ));
+        let lone_quote = b"@daily \"";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(lone_quote.len()),
+                lone_quote,
+                stat(lone_quote.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::MalformedSyntax)
+        ));
+        let quoted_spaces = b"@daily \"   \"";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(quoted_spaces.len()),
+                quoted_spaces,
+                stat(quoted_spaces.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            FcronTableResult::Present(_)
+        ));
+        let rows = fcron_3_4_1_evidence_for_table(
+            &normalize_fcron_3_4_1_file(
+                stat(quoted_with_args.len()),
+                quoted_with_args,
+                stat(quoted_with_args.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            Subject::uid(1000),
+            SourceRootId::new(1),
+            1,
+            0,
+        )
+        .unwrap();
+        assert!(rows.iter().all(|row| {
+            row.component() != ObservationComponent::Runtime
+                || matches!(row.presence(), Presence::Unknown(_))
+        }));
+        assert_eq!(
+            rows[0].authority(AuthorityRole::AutomationMapping),
+            AuthorityResolution::NotClaimed
+        );
+        assert!(matches!(
+            normalize_fcron_3_4_1_file(
+                stat(quoted_with_args.len()),
+                quoted_with_args,
+                stat(quoted_with_args.len()),
+                FcronTableKind::SystemSource,
+                None,
+            ),
+            Fcron341TableResult(FcronTableResult::Unavailable(
+                UnavailableReason::UnsafeObjectType,
+            ))
+        ));
+
+        let forms = b"@ 1h \"/bin/echo\" hello\n& 0 5 * * * \"/bin/echo\" hello\n%daily * 5 \"/bin/echo\" hello\n@daily \"/bin/echo\" hello\n";
+        assert!(matches!(
+            normalize_fcron_3_4_1_file(
+                stat(forms.len()),
+                forms,
+                stat(forms.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            Fcron341TableResult(FcronTableResult::Present(_))
+        ));
+        let stable_inputs: &[&[u8]] = &[
+            b"@ 1h /bin/true\n",
+            b"%daily * 5 /bin/true\n",
+            b"0 5 * * * /bin/true\n",
+            b"TZ='Europe/Tokyo'\n@daily /bin/true\n",
+        ];
+        for stable in stable_inputs {
+            let old = normalize_fcron_file(
+                stat(stable.len()),
+                stable,
+                stat(stable.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            );
+            let new = normalize_fcron_3_4_1_file(
+                stat(stable.len()),
+                stable,
+                stat(stable.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            );
+            assert_eq!(old.presence(), new.presence());
+            assert_eq!(old.schedule(), new.raw_state().schedule());
+        }
+        let fully_quoted = b"@daily \"/bin/echo hello\"\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(fully_quoted.len()),
+                fully_quoted,
+                stat(fully_quoted.len()),
+                FcronTableKind::UserSource,
+                Some(1000),
+            ),
+            FcronTableResult::Present(_)
+        ));
     }
 
     #[test]
@@ -1884,11 +2326,32 @@ mod tests {
             .unwrap()
             .user_source("alice")
             .unwrap();
+        assert!(matches!(
+            FcronSpoolRoot::new(&root).unwrap().user_source("systab"),
+            Err(FcronPathError::InvalidUser)
+        ));
         fs::write(root.join("alice.orig"), b"@daily /bin/true\n").unwrap();
         fs::set_permissions(root.join("alice.orig"), fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
             read_fcron_source(&source, None),
             FcronTableResult::Present(_)
+        ));
+        assert!(matches!(
+            read_fcron_3_4_1_source(&source, None).raw_state(),
+            FcronTableResult::Present(_)
+        ));
+        let missing = FcronSpoolRoot::new(&root)
+            .unwrap()
+            .user_source("missing")
+            .unwrap();
+        assert_eq!(
+            read_fcron_3_4_1_source(&missing, None).raw_state(),
+            &FcronTableResult::Absent
+        );
+        let system = FcronSpoolRoot::new(&root).unwrap().system_source();
+        assert!(matches!(
+            read_fcron_3_4_1_source(&system, None).raw_state(),
+            FcronTableResult::Unavailable(UnavailableReason::UnsafeObjectType)
         ));
         assert!(matches!(
             read_fcron_file(&root.join("new.alice"), FcronTableKind::UserSource, None),
