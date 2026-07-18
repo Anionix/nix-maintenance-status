@@ -505,6 +505,7 @@ impl ProviderEvidence {
                 | (Provider::NixOsSystemd, Schedule::Systemd(_))
                 | (Provider::Cronie, Schedule::Cronie(_))
                 | (Provider::Anacron, Schedule::Anacron(_))
+                | (Provider::Fcron, Schedule::Fcron(_))
         );
         if self.component != ObservationComponent::Schedule
             || !provider_matches
