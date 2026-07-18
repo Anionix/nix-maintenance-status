@@ -12,8 +12,8 @@ use std::{fmt, path::Path, sync::Arc};
 use thiserror::Error;
 
 use crate::catalog::{
-    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, ObservedAuthorityIdentity,
-    PackageIdentityObservation, ProviderCatalog,
+    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, AuthorityUnknownReason,
+    ObservedAuthorityIdentity, PackageIdentityObservation, ProviderCatalog,
 };
 #[cfg(test)]
 use crate::catalog::{CatalogScope, ObservedPackageIdentity};
@@ -906,7 +906,25 @@ fn parse_periodic_line(
         }
     }
     let fields: [FcronTimeField; 5] = fields.try_into().expect("five calendar fields");
-    let options = context.options.merge(&local_options);
+    // fcron resets the per-entry run-frequency while parsing a periodic line.
+    // A run-frequency inherited from the file-wide context is therefore not
+    // the same as a local `r(...)` option and must not invalidate the entry.
+    if local_options
+        .iter()
+        .any(|option| matches!(option, FcronOption::RunFrequency(_)))
+    {
+        return Err(ObservationUnknownReason::UnsupportedSyntax);
+    }
+    let inherited = context
+        .options
+        .options()
+        .iter()
+        .filter(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let options = FcronOptionSet::default()
+        .merge(&inherited)
+        .merge(&local_options);
     let full_range = fields
         .iter()
         .zip([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)])
@@ -1203,6 +1221,11 @@ fn ensure_context_options(
     options: &FcronOptionSet,
     kind: FcronEntryKind,
 ) -> Result<(), ObservationUnknownReason> {
+    // LLM contract: a parsed entry is either accepted with options valid for
+    // its kind or becomes UnsupportedSyntax; no option is silently dropped.
+    // Calendar entries reject Random, periodic entries reject Jitter, while
+    // local periodic RunFrequency is rejected at the line parser. Inherited
+    // RunFrequency remains valid because fcron resets it for periodic lines.
     if matches!(kind, FcronEntryKind::Calendar(_))
         && options
             .options()
@@ -1570,6 +1593,18 @@ pub fn resolve_fcron_3_4_1_authority(
     package: &PackageIdentityObservation,
     contract: &AuthorityIdentityObservation,
 ) -> AuthorityResolution {
+    let expected_contract = fcron_3_4_1_contract_observation();
+    if contract != &expected_contract {
+        return AuthorityResolution::Unresolved(match contract {
+            AuthorityIdentityObservation::Unavailable => {
+                AuthorityUnknownReason::IdentityUnavailable
+            }
+            AuthorityIdentityObservation::Malformed => AuthorityUnknownReason::IdentityMalformed,
+            AuthorityIdentityObservation::Known(_) => {
+                AuthorityUnknownReason::ExactBasisUnverifiable
+            }
+        });
+    }
     ProviderCatalog::embedded().resolve_cron_scheduler_semantics(Provider::Fcron, package, contract)
 }
 
@@ -1941,6 +1976,28 @@ mod tests {
         assert_eq!(schedules.len(), 2);
         assert!(schedules[0].timezone().is_none());
         assert!(schedules[1].timezone().is_some());
+        let inherited_run_frequency = b"!runfreq(7)\n%daily * 5 /bin/true\n";
+        let inherited = normalize_fcron_file(
+            stat(inherited_run_frequency.len()),
+            inherited_run_frequency,
+            stat(inherited_run_frequency.len()),
+            FcronTableKind::UserSource,
+            Some(1000),
+        );
+        let inherited_rows =
+            fcron_evidence_for_table(&inherited, Subject::uid(1000), SourceRootId::new(11), 1, 4)
+                .unwrap();
+        let inherited_schedule = inherited_rows.iter().find_map(|row| match row.schedule() {
+            Some(Schedule::Fcron(schedule)) => Some(schedule),
+            _ => None,
+        });
+        assert!(inherited_schedule.is_some_and(|schedule| {
+            schedule.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .all(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        }));
         let missing_key =
             fcron_evidence_for_table(&result, Subject::uid(1000), SourceRootId::new(9), 0, 4)
                 .unwrap();
@@ -2084,10 +2141,17 @@ mod tests {
         );
         assert!(matches!(
             resolve_fcron_3_4_1_authority(
-                &PackageIdentityObservation::Known(package),
+                &PackageIdentityObservation::Known(package.clone()),
                 &fcron_3_4_1_contract_observation(),
             ),
             AuthorityResolution::Unresolved(_)
+        ));
+        assert!(matches!(
+            resolve_fcron_3_4_1_authority(
+                &PackageIdentityObservation::Known(package),
+                &fcron_3_4_0_contract_observation(),
+            ),
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable)
         ));
         assert!(matches!(
             ProviderCatalog::embedded().resolve_observation(
@@ -2410,6 +2474,44 @@ mod tests {
             ),
             FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
         ));
+        let periodic_run_frequency = b"%daily,r(7) * 5 /bin/true\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(periodic_run_frequency.len()),
+                periodic_run_frequency,
+                stat(periodic_run_frequency.len()),
+                FcronTableKind::UserSource,
+                Some(1000)
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
+        let inherited_run_frequency = parse_fcron(
+            "!runfreq(7),s\n%daily * 5 /bin/true\n0 6 * * * /bin/true\n",
+            FcronTableKind::UserSource,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            inherited_run_frequency.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .all(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        );
+        assert!(
+            inherited_run_frequency.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::Serial(true)))
+        );
+        assert!(
+            inherited_run_frequency.entries()[1]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::RunFrequency(7)))
+        );
         let named_exclusion =
             parse_fcron("0 5 * * MON~MON /bin/true\n", FcronTableKind::UserSource)
                 .unwrap()
