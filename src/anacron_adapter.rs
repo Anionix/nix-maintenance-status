@@ -545,11 +545,11 @@ const fn malformed() -> AnacronTableState {
 }
 fn parse_period(value: &str) -> Result<AnacronPeriod, AnacronTableState> {
     Ok(match value {
-        "daily" | "@daily" => AnacronPeriod::Daily,
-        "weekly" | "@weekly" => AnacronPeriod::Weekly,
-        "monthly" | "@monthly" => AnacronPeriod::Monthly,
-        "yearly" | "@yearly" => AnacronPeriod::Yearly,
-        "annually" | "@annually" => AnacronPeriod::Annually,
+        "@daily" => AnacronPeriod::Daily,
+        "@weekly" => AnacronPeriod::Weekly,
+        "@monthly" => AnacronPeriod::Monthly,
+        "@yearly" => AnacronPeriod::Yearly,
+        "@annually" => AnacronPeriod::Annually,
         value => AnacronPeriod::Days(value.parse().map_err(|_| malformed())?),
     })
 }
@@ -567,7 +567,9 @@ fn parse_range(value: &str) -> Result<(u8, u8), AnacronTableState> {
         start.parse().map_err(|_| malformed())?,
         end.parse().map_err(|_| malformed())?,
     );
-    (range.0 <= 23 && range.1 <= 23 && range.0 <= range.1)
+    // The upper bound is exclusive: 24 is valid as the end of the final
+    // hour window, while the start remains a clock hour in 0..=23.
+    (range.0 <= 23 && range.1 <= 24 && range.0 <= range.1)
         .then_some(range)
         .ok_or(malformed())
 }
@@ -735,6 +737,18 @@ mod tests {
             input(AnacronTableProbe::fixture(b"daily 5 x/y /bin/true\n")).table_state(),
             AnacronTableState::Unknown(_)
         ));
+        assert!(matches!(
+            input(AnacronTableProbe::fixture(b"daily 5 x /bin/true\n")).table_state(),
+            AnacronTableState::Unknown(_)
+        ));
+        let end_of_day = input(AnacronTableProbe::fixture(
+            b"START_HOURS_RANGE = 23-24\n@daily 5 x /bin/true\n",
+        ));
+        let Schedule::Anacron(schedule) = end_of_day.evidence().entries()[1].schedule().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(schedule.start_hours_range(), Some((23, 24)));
         let date = normalize_timestamp(&AnacronTimestampProbe::fixture(
             AnacronJobId::new("x").unwrap(),
             b"20260718\n",
@@ -752,7 +766,7 @@ mod tests {
         ));
         let before = AnacronGeneration::new(1, 2, 3, 4, 1);
         let changed = input(AnacronTableProbe(TableProbe::Borrowed {
-            bytes: b"daily 5 x /bin/true\n",
+            bytes: b"@daily 5 x /bin/true\n",
             before,
             after: AnacronGeneration::new(1, 2, 4, 4, 1),
         }));
@@ -782,7 +796,7 @@ mod tests {
         let id = AnacronJobId::new("nix-gc").unwrap();
         let timestamp = AnacronTimestampProbe::fixture(id, b"20260718\n");
         let with_timestamp = input_with(
-            AnacronTableProbe::fixture(b"daily 5 nix-gc /nix/store/gc\n"),
+            AnacronTableProbe::fixture(b"@daily 5 nix-gc /nix/store/gc\n"),
             &[timestamp],
         );
         let last = with_timestamp
