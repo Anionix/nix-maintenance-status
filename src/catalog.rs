@@ -614,6 +614,7 @@ fn package_contract_matches(
             "71894fee3c74f3787e77f21a24fbbe0dffb59e7f"
         }
         (Provider::Fcron, "3.4.0") => "8198d4b90690fb0f53cca931b6e9bb6d4b9e6f83",
+        (Provider::Fcron, "3.4.1") => "a9c1590d9bf8b3ab3b13bba1d2777c7eb3ea6130",
         _ => return false,
     };
     matches!(&identity.0, IdentityKind::Contract { revision, build, .. } if revision == expected && build.as_deref() == Some(version))
