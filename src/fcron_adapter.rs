@@ -5,15 +5,15 @@
 //! this adapter therefore reports only configuration/schedule evidence and
 //! never treats a source table as a loaded or executed job.
 
+use std::ffi::CString;
 use std::io::{self, Read};
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{fmt, path::Path, sync::Arc};
 
+#[cfg(test)]
+use crate::catalog::ObservedPackageIdentity;
 use crate::catalog::{
-    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, CatalogScope,
-    ObservedAuthorityIdentity, ProviderCatalog,
+    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, ObservedAuthorityIdentity,
+    PackageIdentityObservation, ProviderCatalog,
 };
 use crate::evidence::{
     CaptureSequence, DefinitionOccurrence, InputError, ObservationComponent,
@@ -51,8 +51,10 @@ pub enum FcronPathError {
 /// A caller-provided, existing `fcrontabs` root.  The root is intentionally
 /// required before a production source path can be constructed: the adapter
 /// never assumes the distro default and never discovers users or configuration.
-#[derive(Clone, PartialEq, Eq)]
-pub struct FcronSpoolRoot(PathBuf);
+#[derive(Clone)]
+pub struct FcronSpoolRoot {
+    dir: Arc<std::fs::File>,
+}
 
 impl fmt::Debug for FcronSpoolRoot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -84,28 +86,41 @@ impl FcronSpoolRoot {
         if !metadata.file_type().is_dir() || safe_parent_chain(path).is_none() {
             return Err(FcronPathError::UnsafeRoot);
         }
-        Ok(Self(path.to_owned()))
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| FcronPathError::UnsafeRoot)?;
+        let opened = dir.metadata().map_err(|_| FcronPathError::UnsafeRoot)?;
+        if !opened.is_dir() || !same_identity(&metadata, &opened) {
+            return Err(FcronPathError::UnsafeRoot);
+        }
+        Ok(Self { dir: Arc::new(dir) })
     }
 
     pub fn user_source(&self, user: &str) -> Result<FcronSourcePath, FcronPathError> {
         validate_component(user)?;
         Ok(FcronSourcePath {
-            path: self.0.join(format!("{user}.orig")),
+            root: Arc::clone(&self.dir),
+            basename: format!("{user}.orig"),
             kind: FcronTableKind::UserSource,
         })
     }
 
     pub fn system_source(&self) -> FcronSourcePath {
         FcronSourcePath {
-            path: self.0.join("systab.orig"),
+            root: Arc::clone(&self.dir),
+            basename: String::from("systab.orig"),
             kind: FcronTableKind::SystemSource,
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct FcronSourcePath {
-    path: PathBuf,
+    root: Arc<std::fs::File>,
+    basename: String,
     kind: FcronTableKind,
 }
 
@@ -191,6 +206,11 @@ pub enum FcronTableResult {
 }
 
 impl FcronTableResult {
+    // LLM contract: this total projection preserves the five source states
+    // one-for-one. Absent and PresentEmpty remain known structural facts;
+    // Unknown and Unavailable retain their normalized reasons. No projection
+    // upgrades failure to absence or performs I/O, parsing, inference, or
+    // runtime scheduler observation.
     pub const fn presence(&self) -> Presence {
         match self {
             Self::Absent => Presence::Absent,
@@ -261,49 +281,36 @@ pub fn read_fcron_source(
     source: &FcronSourcePath,
     expected_owner: Option<u32>,
 ) -> FcronTableResult {
-    read_fcron_file_inner(&source.path, source.kind, expected_owner)
+    read_fcron_file_inner(&source.root, &source.basename, source.kind, expected_owner)
 }
 
 #[cfg(unix)]
+#[deprecated(note = "use FcronSpoolRoot::user_source/system_source and read_fcron_source")]
 pub fn read_fcron_file(
-    path: &Path,
-    kind: FcronTableKind,
-    expected_owner: Option<u32>,
+    _path: &Path,
+    _kind: FcronTableKind,
+    _expected_owner: Option<u32>,
 ) -> FcronTableResult {
-    if !allowed_path(path, kind) || safe_parent_chain(path).is_none() {
-        return FcronTableResult::Unavailable(UnavailableReason::UnsafeObjectType);
-    }
-    read_fcron_file_inner(path, kind, expected_owner)
+    // Arbitrary paths are fixture-only; production reads must carry an
+    // anchored FcronSpoolRoot/FcronSourcePath pair.
+    FcronTableResult::Unavailable(UnavailableReason::UnsafeObjectType)
 }
 
 #[cfg(unix)]
+// LLM contract: this is the only production file-read transition. The
+// validated root directory fd and basename are immutable inputs; openat with
+// no-follow creates a stable leaf, and fstat-before/read/fstat-after accepts
+// only one unchanged regular file on the root device. ENOENT is Absent;
+// object, permission, resource, and TOCTOU failures are Unavailable; parsing
+// then produces Present/PresentEmpty or Unknown. No pathname is re-resolved
+// after the root is opened and no command, network, NSS, lock, or write runs.
 fn read_fcron_file_inner(
-    path: &Path,
+    root: &Arc<std::fs::File>,
+    basename: &str,
     kind: FcronTableKind,
     expected_owner: Option<u32>,
 ) -> FcronTableResult {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-    let lstat = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return FcronTableResult::Absent,
-        Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
-    };
-    if !lstat.file_type().is_file() {
-        return FcronTableResult::Unavailable(UnavailableReason::UnsafeObjectType);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if safe_parent_chain(path) != Some(lstat.dev()) {
-            return FcronTableResult::Unavailable(UnavailableReason::UnsafeObjectType);
-        }
-    }
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let file = match open_fcron_leaf(root, basename) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return FcronTableResult::Absent,
         Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
@@ -312,7 +319,11 @@ fn read_fcron_file_inner(
         Ok(metadata) => stat_from_metadata(&metadata),
         Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
     };
-    if !stat_from_metadata(&lstat).same_generation(before) {
+    let root_stat = match root.metadata() {
+        Ok(metadata) => stat_from_metadata(&metadata),
+        Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
+    };
+    if !before.regular || before.dev != root_stat.dev {
         return FcronTableResult::Unavailable(UnavailableReason::ChangedDuringRead);
     }
     if before.size > MAX_FCRON_BYTES as u64 {
@@ -330,6 +341,29 @@ fn read_fcron_file_inner(
         Err(error) => return FcronTableResult::Unavailable(io_reason(error)),
     };
     normalize_fcron_file(before, &bytes, after, kind, expected_owner)
+}
+
+#[cfg(unix)]
+fn open_fcron_leaf(root: &Arc<std::fs::File>, basename: &str) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = CString::new(basename).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: root is an open directory fd retained by FcronSpoolRoot, name
+    // is NUL-free and validated as one basename, and ownership transfers only
+    // on a nonnegative descriptor.
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: fd is a fresh descriptor owned by this File.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
 }
 
 #[cfg(unix)]
@@ -356,31 +390,10 @@ fn safe_parent_chain(path: &Path) -> Option<u64> {
     }
 }
 
-fn allowed_path(path: &Path, kind: FcronTableKind) -> bool {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if !name.ends_with(".orig")
-        || name.len() <= ".orig".len()
-        || name.chars().any(char::is_control)
-        || name.contains('/')
-    {
-        return false;
-    }
-    match kind {
-        FcronTableKind::UserSource => name != "systab.orig",
-        FcronTableKind::SystemSource => name == "systab.orig",
-    }
+#[cfg(unix)]
+fn same_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(unix)]
@@ -554,7 +567,21 @@ fn parse_at_line(rest: &str, context: &mut ParseContext) -> Result<(), Observati
         let frequency = parts.next().unwrap_or("");
         (Vec::new(), frequency, parts.next().unwrap_or("").trim())
     } else if parse_time_value(head).is_ok() {
-        (Vec::new(), head, tail)
+        // Official shorthand: `@5 1h command` means first(5), then a
+        // one-hour cadence. Without the second duration, `@5 command` is
+        // simply a five-minute cadence.
+        let mut parts = tail.splitn(2, char::is_whitespace);
+        let second = parts.next().unwrap_or("");
+        let remainder = parts.next().unwrap_or("").trim_start();
+        if parse_time_value(second).is_ok() && !remainder.is_empty() {
+            (
+                vec![FcronOption::First(parse_time_value(head)?)],
+                second,
+                remainder,
+            )
+        } else {
+            (Vec::new(), head, tail)
+        }
     } else {
         let options = parse_options(head)?;
         let mut parts = tail.splitn(2, char::is_whitespace);
@@ -677,34 +704,48 @@ fn parse_periodic_line(
         | FcronPeriodicKeyword::Months
         | FcronPeriodicKeyword::DayOfWeek => 5,
     };
-    let mut fields = Vec::new();
-    for (index, (min, max, names)) in [
+    let remaining = tokens.collect::<Vec<_>>();
+    let ranges = [
         (0, 59, false),
         (0, 23, false),
         (1, 31, false),
         (1, 12, true),
         (0, 7, true),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if index < needed {
-            let token = tokens
-                .next()
-                .ok_or(ObservationUnknownReason::MalformedSyntax)?;
+    ];
+    // Short periodic forms use only the fields relevant to their keyword,
+    // while the full five-field spelling is also official. Consume additional
+    // leading field-shaped tokens when present, preserving their semantics.
+    let mut field_count = needed;
+    while field_count < ranges.len() {
+        let Some(token) = remaining.get(field_count) else {
+            break;
+        };
+        let (min, max, names) = ranges[field_count];
+        if parse_field(token, min, max, names).is_err() {
+            break;
+        }
+        field_count += 1;
+    }
+    if remaining.len() <= field_count {
+        return Err(ObservationUnknownReason::MalformedSyntax);
+    }
+    let mut fields = Vec::new();
+    for (index, (min, max, names)) in ranges.into_iter().enumerate() {
+        if index < field_count {
             fields.push(
-                parse_field(token, min, max, names)
+                parse_field(remaining[index], min, max, names)
                     .map_err(|_| ObservationUnknownReason::UnsupportedSyntax)?,
             );
         } else {
             fields.push(FcronTimeField::new(vec![FcronFieldAtom::Any]).expect("Any is nonempty"));
         }
     }
-    if tokens.next().is_none() {
-        return Err(ObservationUnknownReason::MalformedSyntax);
-    }
     let fields: [FcronTimeField; 5] = fields.try_into().expect("five calendar fields");
     let options = context.options.merge(&local_options);
+    let full_range = fields
+        .iter()
+        .zip([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)])
+        .all(|(field, (min, max))| field_is_full_range(field, min, max));
     if matches!(
         keyword,
         FcronPeriodicKeyword::Minutes
@@ -712,7 +753,7 @@ fn parse_periodic_line(
             | FcronPeriodicKeyword::Days
             | FcronPeriodicKeyword::Months
             | FcronPeriodicKeyword::DayOfWeek
-    ) && fields.iter().all(field_is_any)
+    ) && full_range
     {
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
@@ -1121,7 +1162,7 @@ fn parse_lavg(value: &str) -> Result<[Option<FcronLoadAverage>; 3], ObservationU
         if fraction.len() != 1 {
             return Err(ObservationUnknownReason::MalformedSyntax);
         }
-        let whole = whole
+        let whole = if whole.is_empty() { "0" } else { whole }
             .parse::<u16>()
             .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
         let fraction = fraction
@@ -1142,7 +1183,7 @@ fn parse_single_lavg(value: &str) -> Result<FcronLoadAverage, ObservationUnknown
     if fraction.len() != 1 {
         return Err(ObservationUnknownReason::MalformedSyntax);
     }
-    let whole = whole
+    let whole = if whole.is_empty() { "0" } else { whole }
         .parse::<u16>()
         .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
     let fraction = fraction
@@ -1177,7 +1218,7 @@ fn parse_field(value: &str, min: u8, max: u8, names: bool) -> Result<FcronTimeFi
             return Err(());
         }
         if base == "*" {
-            if excluded.is_empty() {
+            if excluded.is_empty() && step == 1 {
                 atoms.push(FcronFieldAtom::Any);
             } else {
                 atoms.push(FcronFieldAtom::Range {
@@ -1252,11 +1293,25 @@ fn parse_named_value(value: &str, min: u8, max: u8, names: bool) -> Option<u8> {
     None
 }
 
-fn field_is_any(field: &FcronTimeField) -> bool {
-    matches!(field.atoms(), [FcronFieldAtom::Any])
+fn field_is_full_range(field: &FcronTimeField, min: u8, max: u8) -> bool {
+    match field.atoms() {
+        [FcronFieldAtom::Any] => true,
+        [
+            FcronFieldAtom::Range {
+                start,
+                end,
+                step,
+                excluded,
+            },
+        ] => *start == min && *end == max && *step == 1 && excluded.is_empty(),
+        _ => false,
+    }
 }
 
-fn fcron_scheduler_authority() -> AuthorityResolution {
+/// Build the exact fcron 3.4.0 scheduler ContractPin used by the embedded
+/// catalog.  A caller still supplies the observed package identity to the
+/// resolver; this helper only prevents callers from inventing a weaker pin.
+pub fn fcron_3_4_0_contract_observation() -> AuthorityIdentityObservation {
     let identity = ObservedAuthorityIdentity::contract_with_fingerprint(
         "yo8192/fcron",
         "8198d4b90690fb0f53cca931b6e9bb6d4b9e6f83",
@@ -1265,25 +1320,31 @@ fn fcron_scheduler_authority() -> AuthorityResolution {
         None,
         Some("fcron-3.4.0-v1"),
     );
-    let Ok(identity) = identity else {
-        return AuthorityResolution::Unresolved(
-            crate::catalog::AuthorityUnknownReason::IdentityMalformed,
-        );
-    };
-    ProviderCatalog::embedded().resolve_observation(
-        AuthorityRole::SchedulerSemantics,
-        CatalogScope::Provider(Provider::Fcron),
-        &AuthorityIdentityObservation::Known(identity),
-    )
+    match identity {
+        Ok(identity) => AuthorityIdentityObservation::Known(identity),
+        Err(_) => AuthorityIdentityObservation::Malformed,
+    }
 }
 
-pub fn resolve_fcron_3_4_0_authority() -> AuthorityResolution {
-    fcron_scheduler_authority()
+/// Resolve scheduler semantics only when both version/package evidence and the
+/// exact ContractPin are observed. Unknown or mismatched inputs remain
+/// Unresolved; this function never treats a hard-coded revision as observed.
+pub fn resolve_fcron_3_4_0_authority(
+    package: &PackageIdentityObservation,
+    contract: &AuthorityIdentityObservation,
+) -> AuthorityResolution {
+    ProviderCatalog::embedded().resolve_cron_scheduler_semantics(Provider::Fcron, package, contract)
 }
 
 /// Convert source-only fcron configuration into report evidence. Runtime,
 /// Activity, Runs, and LastResult remain Unknown because the daemon ignores
 /// `.orig` files and the adapter never reads compiled state or logs.
+// LLM contract: only a Present schedule receives a source occurrence and can
+// become an inventory candidate. Absent, PresentEmpty, Unknown, and Unavailable
+// stay evidence-only; runtime-like claims are always Unknown. Exact package and
+// ContractPin observations may resolve SchedulerSemantics, while missing or
+// mismatched authority remains Unresolved. This transition is pure and does
+// no I/O, NSS, network, telemetry, mutation, elevation, or GC execution.
 pub fn fcron_evidence_for_table(
     result: &FcronTableResult,
     subject: Subject,
@@ -1291,6 +1352,30 @@ pub fn fcron_evidence_for_table(
     ordinal: u32,
     capture: u32,
 ) -> Result<Vec<ProviderEvidence>, InputError> {
+    fcron_evidence_for_table_with_authority(
+        result,
+        subject,
+        source_id,
+        ordinal,
+        capture,
+        &PackageIdentityObservation::Unavailable,
+        &AuthorityIdentityObservation::Unavailable,
+    )
+}
+
+/// Variant for a caller that has independently probed the package and exact
+/// scheduler contract. Source-only evidence remains useful without it, but
+/// only this seam can produce a Resolved SchedulerSemantics authority.
+pub fn fcron_evidence_for_table_with_authority(
+    result: &FcronTableResult,
+    subject: Subject,
+    source_id: SourceRootId,
+    ordinal: u32,
+    capture: u32,
+    package: &PackageIdentityObservation,
+    contract: &AuthorityIdentityObservation,
+) -> Result<Vec<ProviderEvidence>, InputError> {
+    let scheduler_authority = resolve_fcron_3_4_0_authority(package, contract);
     let occurrence = result.schedule().map(|_| {
         DefinitionOccurrence::new(
             ProviderLogicalKey::Anonymous,
@@ -1317,10 +1402,7 @@ pub fn fcron_evidence_for_table(
             && let Some(schedule) = result.schedule()
         {
             row = row.with_schedule(Schedule::Fcron(schedule.clone()))?;
-            row = row.with_authority(
-                AuthorityRole::SchedulerSemantics,
-                fcron_scheduler_authority(),
-            )?;
+            row = row.with_authority(AuthorityRole::SchedulerSemantics, scheduler_authority)?;
         }
         rows.push(row);
     }
@@ -1378,12 +1460,6 @@ pub fn normalize_fcron_snapshot(
         )?)?,
         table_state: result,
     })
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-fn _read_path_is_fixture_safe(path: &Path) -> bool {
-    allowed_path(path, FcronTableKind::UserSource)
 }
 
 #[cfg(test)]
@@ -1473,9 +1549,27 @@ mod tests {
 
     #[test]
     fn authority_is_exact_and_runtime_is_unavailable() {
+        let package = ObservedPackageIdentity::new(
+            Provider::Fcron,
+            "3.4.0",
+            "6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee",
+            "f4e7fc553cdd70ff4b3b6ac9138b3b7cffab9198b8c266d97af0a87506e0e1b5",
+            &["245d7f3c07386bf586bad9452b2399cfaba6f88a8f33e6cd125d632b164e21a2"],
+        )
+        .unwrap();
         assert!(matches!(
-            resolve_fcron_3_4_0_authority(),
+            resolve_fcron_3_4_0_authority(
+                &PackageIdentityObservation::Known(package.clone()),
+                &fcron_3_4_0_contract_observation(),
+            ),
             AuthorityResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolve_fcron_3_4_0_authority(
+                &PackageIdentityObservation::Unavailable,
+                &fcron_3_4_0_contract_observation(),
+            ),
+            AuthorityResolution::Unresolved(_)
         ));
         let result = FcronTableResult::Present(
             parse_fcron("@daily /bin/true\n", FcronTableKind::UserSource)
@@ -1485,6 +1579,24 @@ mod tests {
         let rows =
             fcron_evidence_for_table(&result, Subject::uid(1000), SourceRootId::new(1), 1, 0)
                 .unwrap();
+        assert!(matches!(
+            rows[1].authority(AuthorityRole::SchedulerSemantics),
+            AuthorityResolution::Unresolved(_)
+        ));
+        let rows = fcron_evidence_for_table_with_authority(
+            &result,
+            Subject::uid(1000),
+            SourceRootId::new(1),
+            1,
+            0,
+            &PackageIdentityObservation::Known(package),
+            &fcron_3_4_0_contract_observation(),
+        )
+        .unwrap();
+        assert!(matches!(
+            rows[1].authority(AuthorityRole::SchedulerSemantics),
+            AuthorityResolution::Resolved(_)
+        ));
         assert_eq!(
             rows[0].authority(AuthorityRole::AutomationMapping),
             AuthorityResolution::NotClaimed
@@ -1507,6 +1619,34 @@ mod tests {
             Some(1000),
         );
         assert!(matches!(bare_result, FcronTableResult::Present(_)));
+        let shorthand = parse_fcron("@5 1h /bin/true\n", FcronTableKind::UserSource)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            shorthand.entries()[0].kind(),
+            FcronEntryKind::Elapsed { frequency } if frequency.seconds() == 3_600
+        ));
+        assert!(
+            shorthand.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(
+                    option,
+                    FcronOption::First(value) if value.seconds() == 300
+                ))
+        );
+        let stepped = parse_fcron("0 */2 * * * /bin/true\n", FcronTableKind::UserSource)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stepped.entries()[0].kind(),
+            FcronEntryKind::Calendar(fields)
+                if matches!(
+                    fields.fields()[1].atoms(),
+                    [FcronFieldAtom::Range { start: 0, end: 23, step: 2, excluded }] if excluded.is_empty()
+                )
+        ));
         for line in [
             b"@reboot /bin/true\n".as_slice(),
             b"@resume /bin/true\n".as_slice(),
@@ -1535,7 +1675,18 @@ mod tests {
             ),
             FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
         ));
-        let options = b"!first(0),until(1s)\n%nightly,lavg(1,2.5,255) * 1 /bin/true\n";
+        let full_range_periodic = b"%hours * 0-23 * * * /bin/true\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(full_range_periodic.len()),
+                full_range_periodic,
+                stat(full_range_periodic.len()),
+                FcronTableKind::UserSource,
+                Some(1000)
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
+        let options = b"!first(0),until(1s)\n%nightly,lavg(.5,2.5,255) * 1 /bin/true\n";
         assert!(matches!(
             normalize_fcron_file(
                 stat(options.len()),
@@ -1581,6 +1732,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(deprecated)]
     fn production_path_requires_explicit_spool_root_and_rejects_parent_links() {
         use std::fs;
         use std::os::unix::fs::{PermissionsExt, symlink};
