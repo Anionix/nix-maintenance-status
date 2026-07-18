@@ -13,7 +13,8 @@ categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [dependencies]
-anyhow = "1.0.102"
+error-stack = "0.8.0"
+rancor = "0.1.2"
 thiserror = "2.0.18"
 
 [features]
