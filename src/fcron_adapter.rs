@@ -12,8 +12,8 @@ use std::{fmt, path::Path, sync::Arc};
 use thiserror::Error;
 
 use crate::catalog::{
-    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, ObservedAuthorityIdentity,
-    PackageIdentityObservation, ProviderCatalog,
+    AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, AuthorityUnknownReason,
+    ObservedAuthorityIdentity, PackageIdentityObservation, ProviderCatalog,
 };
 #[cfg(test)]
 use crate::catalog::{CatalogScope, ObservedPackageIdentity};
@@ -1203,6 +1203,10 @@ fn ensure_context_options(
     options: &FcronOptionSet,
     kind: FcronEntryKind,
 ) -> Result<(), ObservationUnknownReason> {
+    // LLM contract: a parsed entry is either accepted with options valid for
+    // its kind or becomes UnsupportedSyntax; no option is silently dropped.
+    // Calendar entries reject Random, periodic entries reject Jitter and
+    // RunFrequency, while all other options remain local to this pure parser.
     if matches!(kind, FcronEntryKind::Calendar(_))
         && options
             .options()
@@ -1212,10 +1216,12 @@ fn ensure_context_options(
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
     if matches!(kind, FcronEntryKind::Periodic { .. })
-        && options
-            .options()
-            .iter()
-            .any(|option| matches!(option, FcronOption::Jitter(_)))
+        && options.options().iter().any(|option| {
+            matches!(
+                option,
+                FcronOption::Jitter(_) | FcronOption::RunFrequency(_)
+            )
+        })
     {
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
@@ -1570,6 +1576,18 @@ pub fn resolve_fcron_3_4_1_authority(
     package: &PackageIdentityObservation,
     contract: &AuthorityIdentityObservation,
 ) -> AuthorityResolution {
+    let expected_contract = fcron_3_4_1_contract_observation();
+    if contract != &expected_contract {
+        return AuthorityResolution::Unresolved(match contract {
+            AuthorityIdentityObservation::Unavailable => {
+                AuthorityUnknownReason::IdentityUnavailable
+            }
+            AuthorityIdentityObservation::Malformed => AuthorityUnknownReason::IdentityMalformed,
+            AuthorityIdentityObservation::Known(_) => {
+                AuthorityUnknownReason::ExactBasisUnverifiable
+            }
+        });
+    }
     ProviderCatalog::embedded().resolve_cron_scheduler_semantics(Provider::Fcron, package, contract)
 }
 
@@ -2084,10 +2102,17 @@ mod tests {
         );
         assert!(matches!(
             resolve_fcron_3_4_1_authority(
-                &PackageIdentityObservation::Known(package),
+                &PackageIdentityObservation::Known(package.clone()),
                 &fcron_3_4_1_contract_observation(),
             ),
             AuthorityResolution::Unresolved(_)
+        ));
+        assert!(matches!(
+            resolve_fcron_3_4_1_authority(
+                &PackageIdentityObservation::Known(package),
+                &fcron_3_4_0_contract_observation(),
+            ),
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable)
         ));
         assert!(matches!(
             ProviderCatalog::embedded().resolve_observation(
@@ -2405,6 +2430,17 @@ mod tests {
                 stat(unsupported_periodic.len()),
                 unsupported_periodic,
                 stat(unsupported_periodic.len()),
+                FcronTableKind::UserSource,
+                Some(1000)
+            ),
+            FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
+        let periodic_run_frequency = b"%daily,r(7) * 5 /bin/true\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(periodic_run_frequency.len()),
+                periodic_run_frequency,
+                stat(periodic_run_frequency.len()),
                 FcronTableKind::UserSource,
                 Some(1000)
             ),
