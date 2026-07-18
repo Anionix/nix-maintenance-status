@@ -1237,6 +1237,18 @@ fn update_timezone(context: &mut ParseContext, options: &[FcronOption]) {
     }
 }
 
+fn entry_timezone(entry: &FcronEntry) -> Option<FcronTimezone> {
+    entry
+        .options()
+        .options()
+        .iter()
+        .find_map(|option| match option {
+            FcronOption::Timezone(value) => Some(value.clone()),
+            FcronOption::TimezoneSystem => None,
+            _ => None,
+        })
+}
+
 fn env_value(value: &str) -> Result<&str, ObservationUnknownReason> {
     let value = value.trim_end();
     if value.bytes().any(|byte| byte < 0x20 && byte != b'\t') {
@@ -1566,7 +1578,8 @@ pub fn resolve_fcron_3_4_1_authority(
 /// `.orig` files and the adapter never reads compiled state or logs.
 // LLM contract: only a Present schedule receives a source occurrence and can
 // become an inventory candidate. Absent, PresentEmpty, Unknown, and Unavailable
-// stay evidence-only; runtime-like claims are always Unknown. Exact package and
+// retain a valid source occurrence as an evidence discriminator but remain
+// evidence-only; runtime-like claims are always Unknown. Exact package and
 // ContractPin observations may resolve SchedulerSemantics, while missing or
 // mismatched authority remains Unresolved. This transition is pure and does
 // no I/O, NSS, network, telemetry, mutation, elevation, or GC execution.
@@ -1619,66 +1632,150 @@ fn fcron_evidence_for_table_with_resolved_authority(
     capture: u32,
     scheduler_authority: AuthorityResolution,
 ) -> Result<Vec<ProviderEvidence>, InputError> {
-    let occurrence = if let Some(schedule) = result.schedule() {
-        Some(
-            DefinitionOccurrence::new(
-                ProviderLogicalKey::Anonymous,
-                SourceOccurrenceKey::new(SourceRoot::FcronTable(source_id), ordinal),
-                CaptureSequence::new(capture),
-            )
-            .with_shape(DefinitionShape::Fcron {
-                schedule: ShapeState::Known(schedule.clone()),
-                command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            })?,
-        )
+    let source_key_available = source_id != SourceRootId::new(0) && ordinal != 0;
+    let evidence_presence = if source_key_available {
+        result.presence()
     } else {
-        None
+        Presence::Unavailable(UnavailableReason::MalformedEvidence)
     };
-    let mut rows = Vec::new();
-    for component in [
-        ObservationComponent::Configuration,
-        ObservationComponent::Schedule,
-    ] {
-        let mut row = match occurrence.as_ref() {
-            Some(occurrence) => ProviderEvidence::with_occurrence(
-                Provider::Fcron,
-                subject,
-                component,
-                result.presence(),
-                occurrence.clone(),
-            )?,
-            None => ProviderEvidence::new(Provider::Fcron, subject, component, result.presence())?,
-        };
-        if component == ObservationComponent::Schedule
-            && let Some(schedule) = result.schedule()
-        {
-            row = row.with_schedule(Schedule::Fcron(schedule.clone()))?;
-            row = row.with_authority(AuthorityRole::SchedulerSemantics, scheduler_authority)?;
+    let source_occurrence = source_key_available.then(|| {
+        DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(SourceRoot::FcronTable(source_id), ordinal),
+            CaptureSequence::new(capture),
+        )
+    });
+    let evidence_only_rows = |presence: Presence, occurrence: Option<&DefinitionOccurrence>| {
+        let mut rows = Vec::new();
+        for component in [
+            ObservationComponent::Configuration,
+            ObservationComponent::Schedule,
+        ] {
+            let mut row = match occurrence {
+                Some(occurrence) => ProviderEvidence::with_occurrence(
+                    Provider::Fcron,
+                    subject,
+                    component,
+                    presence,
+                    occurrence.clone(),
+                )?,
+                None => ProviderEvidence::new(Provider::Fcron, subject, component, presence)?,
+            };
+            if component == ObservationComponent::Schedule {
+                row = row.with_authority(AuthorityRole::SchedulerSemantics, scheduler_authority)?;
+            }
+            rows.push(row);
         }
-        rows.push(row);
+        for component in [
+            ObservationComponent::Runtime,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ] {
+            let runtime_presence = Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax);
+            rows.push(match occurrence {
+                Some(occurrence) => ProviderEvidence::with_occurrence(
+                    Provider::Fcron,
+                    subject,
+                    component,
+                    runtime_presence,
+                    occurrence.clone(),
+                )?,
+                None => {
+                    ProviderEvidence::new(Provider::Fcron, subject, component, runtime_presence)?
+                }
+            });
+        }
+        Ok(rows)
+    };
+    let Some(schedule) = result.schedule().filter(|_| source_key_available) else {
+        // LLM contract: non-Present source states are evidence-only. They do
+        // not create an invented definition; Unknown/Unavailable reasons are
+        // retained and a missing source key never becomes an inferred one.
+        return evidence_only_rows(evidence_presence, source_occurrence.as_ref());
+    };
+
+    let last_index = schedule.entries().len().checked_sub(1);
+    let ordinal_fits = last_index
+        .and_then(|last| u32::try_from(last).ok())
+        .and_then(|last| ordinal.checked_add(last))
+        .is_some();
+    if !ordinal_fits {
+        // A source-local key that cannot be represented deterministically is
+        // unavailable, not a parser error. Drop the occurrence discriminator
+        // so no malformed candidate can enter the inventory.
+        return evidence_only_rows(
+            Presence::Unavailable(UnavailableReason::MalformedEvidence),
+            None,
+        );
     }
-    for component in [
-        ObservationComponent::Runtime,
-        ObservationComponent::Activity,
-        ObservationComponent::Runs,
-        ObservationComponent::LastResult,
-    ] {
-        rows.push(match occurrence.as_ref() {
-            Some(occurrence) => ProviderEvidence::with_occurrence(
+
+    // LLM contract: a Present table transitions to one occurrence per
+    // normalized entry, with a deterministic source-local ordinal. Capture
+    // remains occurrence evidence; the later inventory seam decides whether
+    // to exclude it from logical identity. Command bytes and I/O never enter
+    // identity or output.
+    let mut rows = Vec::with_capacity(schedule.entries().len() * 7);
+    for (index, entry) in schedule.entries().iter().enumerate() {
+        let entry_schedule = FcronSchedule::new(
+            vec![entry.clone()],
+            entry.options().clone(),
+            entry_timezone(entry),
+        )
+        .map_err(|_| InputError::InvalidNormalizedValue)?;
+        let occurrence = DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(
+                SourceRoot::FcronTable(source_id),
+                ordinal
+                    .checked_add(index as u32)
+                    .ok_or(InputError::InvalidNormalizedValue)?,
+            ),
+            CaptureSequence::new(capture),
+        )
+        .with_shape(DefinitionShape::Fcron {
+            schedule: ShapeState::Known(entry_schedule.clone()),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        })?;
+        for component in [
+            ObservationComponent::Configuration,
+            ObservationComponent::Schedule,
+        ] {
+            let mut row = ProviderEvidence::with_occurrence(
+                Provider::Fcron,
+                subject,
+                component,
+                Presence::Present,
+                occurrence.clone(),
+            )?;
+            if component == ObservationComponent::Schedule {
+                row = row.with_schedule(Schedule::Fcron(entry_schedule.clone()))?;
+                row = row.with_authority(AuthorityRole::SchedulerSemantics, scheduler_authority)?;
+            }
+            rows.push(row);
+        }
+        rows.push(ProviderEvidence::with_occurrence(
+            Provider::Fcron,
+            subject,
+            ObservationComponent::Command,
+            Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax),
+            occurrence.clone(),
+        )?);
+        for component in [
+            ObservationComponent::Runtime,
+            ObservationComponent::Activity,
+            ObservationComponent::Runs,
+            ObservationComponent::LastResult,
+        ] {
+            rows.push(ProviderEvidence::with_occurrence(
                 Provider::Fcron,
                 subject,
                 component,
                 Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax),
                 occurrence.clone(),
-            )?,
-            None => ProviderEvidence::new(
-                Provider::Fcron,
-                subject,
-                component,
-                Presence::Unknown(ObservationUnknownReason::UnsupportedSyntax),
-            )?,
-        });
+            )?);
+        }
     }
     Ok(rows)
 }
@@ -1791,6 +1888,78 @@ mod tests {
                 .iter()
                 .any(|entry| !entry.options().options().is_empty())
         );
+    }
+
+    #[test]
+    fn present_table_keeps_one_occurrence_per_entry() {
+        let text = b"@daily /bin/true\n@daily /bin/true\n";
+        let result = normalize_fcron_file(
+            stat(text.len()),
+            text,
+            stat(text.len()),
+            FcronTableKind::UserSource,
+            Some(1000),
+        );
+        let rows =
+            fcron_evidence_for_table(&result, Subject::uid(1000), SourceRootId::new(9), 99, 4)
+                .unwrap();
+        let mut occurrences: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.occurrence())
+            .cloned()
+            .collect();
+        occurrences.sort();
+        occurrences.dedup();
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(
+            occurrences
+                .iter()
+                .map(|occurrence| occurrence.source().ordinal())
+                .collect::<Vec<_>>(),
+            vec![99, 100]
+        );
+        assert_eq!(rows.len(), 14);
+        assert!(format!("{rows:?}").contains("<opaque>"));
+        let contextual_text = b"@daily /bin/true\n!timezone(Europe/Tokyo)\n@daily /bin/true\n";
+        let contextual = normalize_fcron_file(
+            stat(contextual_text.len()),
+            contextual_text,
+            stat(contextual_text.len()),
+            FcronTableKind::UserSource,
+            Some(1000),
+        );
+        let contextual_rows =
+            fcron_evidence_for_table(&contextual, Subject::uid(1000), SourceRootId::new(10), 1, 4)
+                .unwrap();
+        let schedules: Vec<_> = contextual_rows
+            .iter()
+            .filter_map(|row| match row.schedule() {
+                Some(Schedule::Fcron(schedule)) => Some(schedule),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(schedules.len(), 2);
+        assert!(schedules[0].timezone().is_none());
+        assert!(schedules[1].timezone().is_some());
+        let missing_key =
+            fcron_evidence_for_table(&result, Subject::uid(1000), SourceRootId::new(9), 0, 4)
+                .unwrap();
+        assert!(missing_key.iter().all(|row| row.occurrence().is_none()));
+        assert!(missing_key.iter().take(2).all(|row| {
+            row.presence() == Presence::Unavailable(UnavailableReason::MalformedEvidence)
+        }));
+        let overflow = fcron_evidence_for_table(
+            &result,
+            Subject::uid(1000),
+            SourceRootId::new(9),
+            u32::MAX,
+            4,
+        )
+        .unwrap();
+        assert!(overflow.iter().all(|row| row.occurrence().is_none()));
+        assert!(overflow.iter().take(2).all(|row| {
+            row.presence() == Presence::Unavailable(UnavailableReason::MalformedEvidence)
+        }));
     }
 
     #[test]
@@ -2335,7 +2504,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(rows.iter().all(|row| row.occurrence().is_none()));
+        assert!(rows.iter().all(|row| row.occurrence().is_some()));
     }
 
     #[cfg(unix)]
