@@ -65,7 +65,7 @@ impl SystemdBusScope {
 
 pub const READ_ONLY_METHODS: &[&str] = &[
     "ListUnitFilesByPatterns",
-    "ListUnitsByNames",
+    "ListUnitsByPatterns",
     "GetUnit",
     "GetAll",
 ];
@@ -74,7 +74,7 @@ pub const READ_ONLY_METHODS: &[&str] = &[
 #[derive(Debug, Clone, Copy)]
 enum ReadOnlyMethod {
     ListUnitFilesByPatterns,
-    ListUnitsByNames,
+    ListUnitsByPatterns,
     GetUnit,
     GetAll,
 }
@@ -84,7 +84,7 @@ impl ReadOnlyMethod {
     const fn name(self) -> &'static str {
         match self {
             Self::ListUnitFilesByPatterns => "ListUnitFilesByPatterns",
-            Self::ListUnitsByNames => "ListUnitsByNames",
+            Self::ListUnitsByPatterns => "ListUnitsByPatterns",
             Self::GetUnit => "GetUnit",
             Self::GetAll => "GetAll",
         }
@@ -216,16 +216,17 @@ mod linux {
             }
         }
 
+        // LLM contract: ListUnitsByPatterns filters only already-loaded units,
+        // so a missing exact identity is Absent without loading it. The target
+        // LoadState=loaded is Present; every other target row is Unavailable.
         fn loaded(&self) -> Presence {
             match self.call::<_, Vec<UnitRow>>(
                 SYSTEMD_MANAGER_PATH,
                 SYSTEMD_MANAGER_INTERFACE,
-                ReadOnlyMethod::ListUnitsByNames,
-                &(vec![NIX_GC_TIMER],),
+                ReadOnlyMethod::ListUnitsByPatterns,
+                &(Vec::<&str>::new(), vec![NIX_GC_TIMER]),
             ) {
-                Ok(units) => normalize_nix_gc_state(exact_row_presence(&units, |unit| {
-                    unit.0 == NIX_GC_TIMER
-                })),
+                Ok(units) => normalize_nix_gc_state(runtime_row_presence(&units)),
                 Err(error) => normalize_nix_gc_state(Err(error)),
             }
         }
@@ -502,6 +503,21 @@ mod linux {
         }
     }
 
+    // LLM contract: the filtered inventory is already loaded by systemd; the
+    // exact timer row is Present only with LoadState=loaded, absent from the
+    // inventory is Absent, and any other target state is Unavailable. This
+    // helper never requests or loads a named unit.
+    pub(super) fn runtime_row_presence(rows: &[UnitRow]) -> Result<bool, SystemdBusError> {
+        if rows.len() > MAX_ROWS {
+            return Err(SystemdBusError::ResourceLimitExceeded);
+        }
+        match rows.iter().find(|unit| unit.0 == NIX_GC_TIMER) {
+            None => Ok(false),
+            Some(unit) if unit.2 == "loaded" => Ok(true),
+            Some(_) => Err(SystemdBusError::InvalidSignature),
+        }
+    }
+
     // LLM contract: only a named property with a bounded reply can become a
     // typed value; missing, malformed, or oversized values never retain raw data.
     fn value<T>(values: &HashMap<String, OwnedValue>, name: &str) -> Result<T, SystemdBusError>
@@ -588,6 +604,9 @@ mod tests {
     #[test]
     fn allowlist_excludes_mutating_systemd_methods() {
         assert!(READ_ONLY_METHODS.contains(&"GetAll"));
+        assert!(READ_ONLY_METHODS.contains(&"ListUnitsByPatterns"));
+        assert!(!READ_ONLY_METHODS.contains(&"ListUnits"));
+        assert!(!READ_ONLY_METHODS.contains(&"ListUnitsByNames"));
         assert!(
             !READ_ONLY_METHODS
                 .iter()
@@ -620,6 +639,26 @@ mod tests {
             linux::exact_row_presence(&["nix-gc.timer"], |unit| *unit == "nix-gc.timer"),
             Ok(true)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_inventory_never_loads_an_absent_unit() {
+        let path = zbus::zvariant::OwnedObjectPath::try_from("/").unwrap();
+        let loaded = (
+            "nix-gc.timer".to_owned(),
+            String::new(),
+            "loaded".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            path.clone(),
+            0,
+            String::new(),
+            path,
+        );
+        assert_eq!(linux::runtime_row_presence(&[]), Ok(false));
+        assert_eq!(linux::runtime_row_presence(&[loaded]), Ok(true));
     }
 
     #[cfg(target_os = "linux")]

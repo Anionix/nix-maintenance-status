@@ -1,5 +1,14 @@
 //! Test-only Linux transport probe used by the isolated NixOS VM fixtures.
 
+#[cfg(target_os = "linux")]
+use nix_maintenance_status::{
+    AuthorityResolution, AuthorityRole, AuthorityUnknownReason, CaptureSequence, Conclusion,
+    ConsistencyValue, DiagnosticInput, ObservationComponent, Presence, Provider, ProviderEvidence,
+    ProviderEvidenceSet, ScanScope, ScanWindow, SourceRootId, Subject, SystemdBusScope,
+    SystemdBusTransport, SystemdTransportError, TargetPlatform, UnavailableReason, diagnose,
+    normalize_systemd_snapshot,
+};
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("systemd VM probe is Linux-only");
@@ -8,12 +17,6 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
-    use nix_maintenance_status::{
-        AuthorityResolution, AuthorityRole, CaptureSequence, Conclusion, ConsistencyValue,
-        DiagnosticInput, ObservationComponent, Presence, ScanScope, ScanWindow, SourceRootId,
-        SystemdBusScope, SystemdBusTransport, TargetPlatform, diagnose, normalize_systemd_snapshot,
-    };
-
     let current_user = std::env::args().any(|arg| arg == "--current-user");
     let scope = if current_user {
         let uid = std::env::var("UID")
@@ -32,21 +35,13 @@ fn main() {
     // seam, then renders the typed inventory. It emits normalized enum labels,
     // never raw bus data, and exits 2 on transport/classification failure
     // without retry, mutation, telemetry, or GC.
-    let transport = SystemdBusTransport::connect(scope).unwrap_or_else(|_| {
-        eprintln!("fixed local systemd bus unavailable");
-        std::process::exit(2);
-    });
+    let transport = SystemdBusTransport::connect(scope)
+        .unwrap_or_else(|error| render_unavailable(scope, transport_error_reason(error)));
     let snapshot = transport
         .probe_nix_gc(SourceRootId::new(1), CaptureSequence::new(1))
-        .unwrap_or_else(|_| {
-            eprintln!("typed systemd probe unavailable");
-            std::process::exit(2);
-        });
+        .unwrap_or_else(|error| render_unavailable(scope, transport_error_reason(error)));
     let report = normalize_systemd_snapshot(snapshot, "0000000000000000000000000000000000000000")
-        .unwrap_or_else(|_| {
-            eprintln!("typed systemd normalization unavailable");
-            std::process::exit(2);
-        });
+        .unwrap_or_else(|_| render_unavailable(scope, UnavailableReason::MalformedEvidence));
     let command = report
         .evidence()
         .entries()
@@ -59,6 +54,8 @@ fn main() {
             Presence::Unavailable(_) => "unknown",
         })
         .unwrap_or("not-applicable");
+    let configuration = evidence_presence(report.evidence(), ObservationComponent::Configuration);
+    let runtime = evidence_presence(report.evidence(), ObservationComponent::Runtime);
     let input = DiagnosticInput::new(
         TargetPlatform::Linux,
         if current_user {
@@ -108,13 +105,15 @@ fn main() {
         )
         .unwrap_or("unknown");
     println!(
-        "scope={} automations={} authority={} consistency={} schedule={} command={} observations={}",
+        "scope={} automations={} configuration={} runtime={} authority={} consistency={} schedule={} command={} observations={}",
         if current_user {
             "current-user"
         } else {
             "system"
         },
         gc_report.automations().len(),
+        configuration,
+        runtime,
         authority,
         consistency,
         schedule,
@@ -133,4 +132,122 @@ fn authority_label(authority: nix_maintenance_status::AuthorityResolution) -> &'
         nix_maintenance_status::AuthorityResolution::NotClaimed => "not-claimed",
         nix_maintenance_status::AuthorityResolution::NotApplicable => "not-applicable",
     }
+}
+
+#[cfg(target_os = "linux")]
+fn evidence_presence(
+    evidence: &nix_maintenance_status::ProviderEvidenceSet,
+    component: nix_maintenance_status::ObservationComponent,
+) -> &'static str {
+    evidence
+        .entries()
+        .iter()
+        .find(|entry| entry.component() == component)
+        .map_or("unknown", |entry| match entry.presence() {
+            Presence::Present | Presence::PresentEmpty => "present",
+            Presence::Absent => "absent",
+            Presence::Unavailable(_) => "unknown",
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn transport_error_reason(error: SystemdTransportError) -> UnavailableReason {
+    // LLM contract: failures map to typed UnavailableReason, never raw text or Absent.
+    match error {
+        SystemdTransportError::Bus(error) => match error.presence() {
+            Presence::Unavailable(reason) => reason,
+            Presence::Absent | Presence::PresentEmpty | Presence::Present => {
+                UnavailableReason::InterfaceUnavailable
+            }
+        },
+        SystemdTransportError::InvalidInput(_) => UnavailableReason::MalformedEvidence,
+        _ => UnavailableReason::InterfaceUnavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unavailable_evidence(scope: SystemdBusScope, reason: UnavailableReason) -> ProviderEvidenceSet {
+    // LLM contract: a failed scope yields only typed Unavailable rows; no Authority or occurrence.
+    let subject = scope.subject();
+    let mut entries = vec![
+        ProviderEvidence::new(
+            Provider::NixOsSystemd,
+            subject,
+            ObservationComponent::Configuration,
+            Presence::Unavailable(reason),
+        )
+        .expect("fixed unavailable configuration row"),
+        ProviderEvidence::new(
+            Provider::NixOsSystemd,
+            subject,
+            ObservationComponent::Runtime,
+            Presence::Unavailable(reason),
+        )
+        .expect("fixed unavailable runtime row"),
+        ProviderEvidence::new(
+            Provider::NixOsSystemd,
+            subject,
+            ObservationComponent::Schedule,
+            Presence::Unavailable(reason),
+        )
+        .expect("fixed unavailable schedule row"),
+    ];
+    if scope == SystemdBusScope::System {
+        entries.push(
+            ProviderEvidence::new(
+                Provider::NixOsSystemd,
+                Subject::System,
+                ObservationComponent::Command,
+                Presence::Unavailable(reason),
+            )
+            .expect("fixed unavailable command row"),
+        );
+    }
+    ProviderEvidenceSet::new(entries).expect("fixed unavailable evidence set")
+}
+
+#[cfg(target_os = "linux")]
+fn unavailable_label(reason: UnavailableReason) -> &'static str {
+    match reason {
+        UnavailableReason::PermissionDenied => "permission-denied",
+        UnavailableReason::MalformedEvidence => "malformed-evidence",
+        UnavailableReason::TimedOut => "timed-out",
+        UnavailableReason::InterfaceUnavailable => "interface-unavailable",
+        _ => "unavailable",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn render_unavailable(scope: SystemdBusScope, reason: UnavailableReason) -> ! {
+    // LLM contract: failed local transport stays Unavailable; emit a normalized reason and exit 2.
+    let evidence = unavailable_evidence(scope, reason);
+    let input = DiagnosticInput::new(
+        TargetPlatform::Linux,
+        match scope {
+            SystemdBusScope::System => ScanScope::System,
+            SystemdBusScope::CurrentUser(_) => ScanScope::CurrentUser,
+        },
+        ScanWindow::new(std::time::UNIX_EPOCH, std::time::Duration::from_secs(1))
+            .expect("fixed scan window"),
+        evidence.clone(),
+    )
+    .expect("fixed unavailable evidence validates");
+    let report = diagnose(input);
+    let (scope_label, authority, command) = match scope {
+        SystemdBusScope::System => (
+            "system",
+            authority_label(AuthorityResolution::Unresolved(
+                AuthorityUnknownReason::IdentityUnavailable,
+            )),
+            "unknown",
+        ),
+        SystemdBusScope::CurrentUser(_) => ("current-user", "not-applicable", "not-applicable"),
+    };
+    println!(
+        "scope={scope_label} automations={} configuration=unknown runtime=unknown authority={authority} consistency=not-applicable schedule=unknown command={command} observations={} unavailable={}",
+        report.automations().len(),
+        evidence.entries().len(),
+        unavailable_label(reason),
+    );
+    std::process::exit(2);
 }

@@ -933,7 +933,7 @@ mod tests {
             Presence::Present,
             1,
             1,
-            Ok(Some(properties)),
+            Ok(Some(properties.clone())),
         )
         .unwrap()
         .with_command(Ok(Some(command)))
@@ -1052,7 +1052,7 @@ mod tests {
             CaptureSequence::new(1),
             Presence::Present,
             Presence::Present,
-            Ok(Some(properties)),
+            Ok(Some(properties.clone())),
         )
         .unwrap()
         .with_command(Ok(Some(command)));
@@ -1107,6 +1107,72 @@ mod tests {
         assert!(matches!(
             claims.command().conclusion(),
             crate::diagnostic::Conclusion::Known(crate::report::ObservationValue::Present)
+        ));
+
+        let changed = SystemdBusSnapshot::new(
+            SystemdManagerIdentity::System,
+            Subject::System,
+            SystemdUnitId::new(NIX_GC_TIMER).unwrap(),
+            SourceRootId::new(7),
+            CaptureSequence::new(1),
+            Presence::Present,
+            Presence::Present,
+            1,
+            2,
+            Ok(Some(properties)),
+        )
+        .unwrap()
+        .with_command(Ok(Some(command)));
+        let changed =
+            normalize_systemd_snapshot(changed, "0000000000000000000000000000000000000000")
+                .unwrap();
+        assert!(
+            changed
+                .evidence()
+                .entries()
+                .iter()
+                .all(|entry| entry.occurrence().is_some())
+        );
+        let changed_input = crate::diagnostic::DiagnosticInput::new(
+            crate::evidence::TargetPlatform::Linux,
+            crate::evidence::ScanScope::System,
+            crate::evidence::ScanWindow::new(std::time::UNIX_EPOCH, Duration::from_secs(1))
+                .unwrap(),
+            changed.evidence().clone(),
+        )
+        .unwrap();
+        let changed_report = crate::diagnostic::diagnose(changed_input);
+        let changed_claims = changed_report.automations()[0].claims();
+        assert!(matches!(
+            changed_claims.configuration().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::ChangedDuringRead
+                )
+            )
+        ));
+        assert!(matches!(
+            changed_claims.runtime().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::ChangedDuringRead
+                )
+            )
+        ));
+        assert!(matches!(
+            changed_claims.consistency().conclusion(),
+            crate::diagnostic::Conclusion::Unknown(
+                crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                    UnavailableReason::ChangedDuringRead
+                )
+            )
+        ));
+        assert!(matches!(
+            changed_claims
+                .configuration()
+                .provenance()
+                .authority(AuthorityRole::AutomationMapping),
+            AuthorityResolution::Unresolved(_)
         ));
     }
 }
