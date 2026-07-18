@@ -1,9 +1,14 @@
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::anacron_adapter::AnacronDate;
 use crate::catalog::{AuthorityResolution, AuthorityRole};
-use crate::report::Schedule;
+use crate::report::{
+    AnacronSchedule, CronieSchedule, CronieUserField, FcronSchedule, LaunchdSchedule, Schedule,
+    SystemdSchedule,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -322,13 +327,168 @@ pub enum ProviderLogicalKey {
     Anonymous,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapeUnknownReason {
+    NotObserved,
+    Unsupported,
+    Ambiguous,
+    Incomplete,
+}
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShapeState<T> {
+    Known(T),
+    Unknown(ShapeUnknownReason),
+    Unavailable(UnavailableReason),
+}
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandSurface {
+    LaunchdShell,
+    SystemdGenerated,
+    DirectArgv,
+    TableEntry,
+}
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileSelection {
+    None,
+    AllOld,
+    OlderThanDays(u32),
+}
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreGcSelection {
+    Delete { max_freed: Option<u64> },
+    Preview,
+}
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InspectionKind {
+    Roots,
+    Live,
+    Dead,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandShape {
+    NixCollectGarbage {
+        surface: CommandSurface,
+        profile: ProfileSelection,
+        store: StoreGcSelection,
+    },
+    NixStoreGc {
+        surface: CommandSurface,
+        mode: StoreGcSelection,
+    },
+    NixStoreInspection {
+        surface: CommandSurface,
+        kind: InspectionKind,
+    },
+    CataloguedNonGc {
+        surface: CommandSurface,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionContext {
+    System,
+    User,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum DefinitionShape {
+    Launchd {
+        schedule: ShapeState<LaunchdSchedule>,
+        command: ShapeState<CommandShape>,
+        context: ShapeState<ExecutionContext>,
+    },
+    Systemd {
+        schedule: ShapeState<SystemdSchedule>,
+        target: ShapeState<SystemdUnitId>,
+        command: ShapeState<CommandShape>,
+        context: ShapeState<ExecutionContext>,
+    },
+    Anacron {
+        schedule: ShapeState<AnacronSchedule>,
+        command: ShapeState<CommandShape>,
+        context: ShapeState<ExecutionContext>,
+    },
+    Cronie {
+        schedule: ShapeState<CronieSchedule>,
+        principal: ShapeState<CronieUserField>,
+        command: ShapeState<CommandShape>,
+        context: ShapeState<ExecutionContext>,
+    },
+    Fcron {
+        schedule: ShapeState<FcronSchedule>,
+        command: ShapeState<CommandShape>,
+        context: ShapeState<ExecutionContext>,
+    },
+}
+
+impl DefinitionShape {
+    pub(crate) const fn provider(&self) -> Provider {
+        match self {
+            Self::Launchd { .. } => Provider::NixDarwinLaunchd,
+            Self::Systemd { .. } => Provider::NixOsSystemd,
+            Self::Anacron { .. } => Provider::Anacron,
+            Self::Cronie { .. } => Provider::Cronie,
+            Self::Fcron { .. } => Provider::Fcron,
+        }
+    }
+
+    pub(crate) fn is_fully_known(&self) -> bool {
+        macro_rules! known { ($($state:expr),+) => { $(matches!($state, ShapeState::Known(_)))&&+ }; }
+        match self {
+            Self::Launchd {
+                schedule,
+                command,
+                context,
+            } => known!(schedule, command, context),
+            Self::Anacron {
+                schedule,
+                command,
+                context,
+            } => known!(schedule, command, context),
+            Self::Fcron {
+                schedule,
+                command,
+                context,
+            } => known!(schedule, command, context),
+            Self::Systemd {
+                schedule,
+                target,
+                command,
+                context,
+            } => known!(schedule, target, command, context),
+            Self::Cronie {
+                schedule,
+                principal,
+                command,
+                context,
+            } => known!(schedule, principal, command, context),
+        }
+    }
+
+    pub(crate) fn known_equal(&self, other: &Self) -> bool {
+        self.is_fully_known() && other.is_fully_known() && self == other
+    }
+}
+
 /// Identity envelope only. Provider-native schedule, command, and execution
 /// shape is added by the provider-specific seams before inventory projection.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub struct DefinitionOccurrence {
     logical_key: ProviderLogicalKey,
     source: SourceOccurrenceKey,
     capture: CaptureSequence,
+    shape: Option<DefinitionShape>,
 }
 
 impl DefinitionOccurrence {
@@ -341,7 +501,32 @@ impl DefinitionOccurrence {
             logical_key,
             source,
             capture,
+            shape: None,
         }
+    }
+
+    // LLM contract: only an adapter attaches one provider-matching shape.
+    // Unknown/Unavailable remains local; no raw command/path/env/account data,
+    // Presence, Authority, or capture order enters the shape.
+    #[allow(dead_code)]
+    pub(crate) fn with_shape(mut self, shape: DefinitionShape) -> Result<Self, InputError> {
+        let valid = matches!(
+            (&self.logical_key, shape.provider()),
+            (
+                ProviderLogicalKey::Launchd { .. },
+                Provider::NixDarwinLaunchd
+            ) | (ProviderLogicalKey::Systemd { .. }, Provider::NixOsSystemd)
+                | (ProviderLogicalKey::Anacron { .. }, Provider::Anacron)
+                | (
+                    ProviderLogicalKey::Anonymous,
+                    Provider::Cronie | Provider::Fcron
+                )
+        );
+        if !valid || self.shape.is_some() {
+            return Err(InputError::InvalidDefinitionOccurrence);
+        }
+        self.shape = Some(shape);
+        Ok(self)
     }
 
     pub const fn logical_key(&self) -> &ProviderLogicalKey {
@@ -352,6 +537,39 @@ impl DefinitionOccurrence {
     }
     pub const fn capture(&self) -> &CaptureSequence {
         &self.capture
+    }
+    pub(crate) const fn shape(&self) -> Option<&DefinitionShape> {
+        self.shape.as_ref()
+    }
+}
+
+impl PartialEq for DefinitionOccurrence {
+    fn eq(&self, other: &Self) -> bool {
+        self.logical_key == other.logical_key
+            && self.source == other.source
+            && self.capture == other.capture
+    }
+}
+impl Eq for DefinitionOccurrence {}
+impl PartialOrd for DefinitionOccurrence {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DefinitionOccurrence {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (&self.logical_key, &self.source, &self.capture).cmp(&(
+            &other.logical_key,
+            &other.source,
+            &other.capture,
+        ))
+    }
+}
+impl Hash for DefinitionOccurrence {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.logical_key.hash(state);
+        self.source.hash(state);
+        self.capture.hash(state);
     }
 }
 
@@ -428,7 +646,12 @@ impl ProviderEvidence {
                 SourceRoot::FcronTable(_)
             )
         );
-        if !identity_matches || !key_subject_matches_domain(occurrence.logical_key(), subject) {
+        if !identity_matches
+            || !key_subject_matches_domain(occurrence.logical_key(), subject)
+            || occurrence
+                .shape()
+                .is_some_and(|shape| shape.provider() != provider)
+        {
             return Err(InputError::InvalidDefinitionOccurrence);
         }
         Ok(Self {
@@ -629,6 +852,14 @@ impl ProviderEvidenceSet {
                         left == right
                             && pair[0].presence == pair[1].presence
                             && pair[0].schedule == pair[1].schedule
+                            && match (left.shape(), right.shape()) {
+                                (None, None) => true,
+                                (Some(left), Some(right)) => {
+                                    left.known_equal(right)
+                                        || (!left.is_fully_known() && !right.is_fully_known())
+                                }
+                                _ => true,
+                            }
                     }
                     _ => true,
                 }
@@ -636,16 +867,22 @@ impl ProviderEvidenceSet {
             return Err(InputError::DuplicateEvidenceKey);
         }
         // LLM contract: one catalogued source slot plus capture can assert one
-        // logical key; a second key is malformed input, not multiplicity.
+        // logical key and one shape; a second key or unresolved shape tie is
+        // malformed input, while distinct captures remain indeterminate.
         if entries.iter().enumerate().any(|(index, left)| {
             entries.iter().skip(index + 1).any(|right| {
                 left.provider == right.provider
                     && left.subject == right.subject
                     && match (left.occurrence.as_ref(), right.occurrence.as_ref()) {
-                        (Some(left), Some(right)) => {
-                            left.source() == right.source()
-                                && left.capture() == right.capture()
-                                && left.logical_key() != right.logical_key()
+                        (Some(occ_left), Some(occ_right)) => {
+                            occ_left.source() == occ_right.source()
+                                && occ_left.capture() == occ_right.capture()
+                                && (occ_left.logical_key() != occ_right.logical_key()
+                                    || (occ_left.logical_key() == occ_right.logical_key()
+                                        && occ_left
+                                            .shape()
+                                            .zip(occ_right.shape())
+                                            .is_some_and(|(left, right)| left != right)))
                         }
                         _ => false,
                     }
@@ -989,6 +1226,61 @@ mod tests {
         )
         .unwrap();
         assert!(ProviderEvidenceSet::new(vec![legacy, first]).is_err());
+    }
+
+    #[test]
+    fn definition_shape_is_typed_complete_and_not_an_unknown_identity_key() {
+        let schedule = LaunchdSchedule::new(Vec::new(), Some(60), false).unwrap();
+        let shape = DefinitionShape::Launchd {
+            schedule: ShapeState::Known(schedule),
+            command: ShapeState::Known(CommandShape::NixCollectGarbage {
+                surface: CommandSurface::LaunchdShell,
+                profile: ProfileSelection::None,
+                store: StoreGcSelection::Delete { max_freed: None },
+            }),
+            context: ShapeState::Known(ExecutionContext::User),
+        };
+        assert!(shape.is_fully_known());
+
+        let first = launchd_occurrence("org.nix.gc", 1, 0)
+            .with_shape(shape.clone())
+            .unwrap();
+        let second = launchd_occurrence("org.nix.gc", 1, 1)
+            .with_shape(shape.clone())
+            .unwrap();
+        assert!(first.shape().unwrap().known_equal(second.shape().unwrap()));
+        assert_ne!(first, second, "capture remains occurrence identity");
+
+        let incomplete = DefinitionShape::Launchd {
+            schedule: ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+            command: ShapeState::Unavailable(UnavailableReason::PermissionDenied),
+            context: ShapeState::Known(ExecutionContext::User),
+        };
+        assert!(!incomplete.is_fully_known());
+        assert!(!incomplete.known_equal(&incomplete));
+
+        let fcron_shape = DefinitionShape::Fcron {
+            schedule: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            command: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+            context: ShapeState::Unknown(ShapeUnknownReason::NotObserved),
+        };
+        let anonymous = DefinitionOccurrence::new(
+            ProviderLogicalKey::Anonymous,
+            SourceOccurrenceKey::new(SourceRoot::CronieTable(SourceRootId::new(2)), 1),
+            CaptureSequence::new(0),
+        )
+        .with_shape(fcron_shape)
+        .unwrap();
+        assert!(
+            ProviderEvidence::with_occurrence(
+                Provider::Cronie,
+                Subject::System,
+                ObservationComponent::Command,
+                Presence::Present,
+                anonymous,
+            )
+            .is_err()
+        );
     }
 
     #[test]
