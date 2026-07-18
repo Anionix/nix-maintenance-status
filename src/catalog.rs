@@ -291,6 +291,64 @@ pub struct IntegrityPin {
     digest: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PackageIdentity {
+    provider: Provider,
+    version: &'static str,
+    nixpkgs_revision: FullRevision,
+    source_digest: &'static str,
+    patch_digests: &'static [&'static str],
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPackageIdentity {
+    provider: Provider,
+    version: String,
+    nixpkgs_revision: String,
+    source_digest: String,
+    patch_digests: Vec<String>,
+}
+#[allow(dead_code)]
+impl ObservedPackageIdentity {
+    pub fn new(
+        provider: Provider,
+        version: &str,
+        nixpkgs_revision: &str,
+        source_digest: &str,
+        patch_digests: &[&str],
+    ) -> Result<Self, CatalogError> {
+        if !valid_identity_text(version)
+            || !valid_revision_text(nixpkgs_revision)
+            || !valid_digest(source_digest)
+            || patch_digests.iter().any(|d| !valid_digest(d))
+        {
+            return Err(CatalogError::InvalidIdentity);
+        }
+        Ok(Self {
+            provider,
+            version: version.to_owned(),
+            nixpkgs_revision: nixpkgs_revision.to_owned(),
+            source_digest: source_digest.to_owned(),
+            patch_digests: patch_digests.iter().map(|d| (*d).to_owned()).collect(),
+        })
+    }
+    fn matches(&self, expected: PackageIdentity) -> bool {
+        self.provider == expected.provider
+            && self.version == expected.version
+            && self.nixpkgs_revision == expected.nixpkgs_revision.0
+            && self.source_digest == expected.source_digest
+            && self.patch_digests.len() == expected.patch_digests.len()
+            && self
+                .patch_digests
+                .iter()
+                .zip(expected.patch_digests)
+                .all(|(actual, expected)| actual == expected)
+    }
+}
+pub enum PackageIdentityObservation {
+    Known(ObservedPackageIdentity),
+    Unavailable,
+    Malformed,
+}
 impl IntegrityPin {
     pub const fn label(self) -> &'static str {
         self.label
@@ -419,7 +477,8 @@ impl ProviderCatalog {
     }
 
     pub fn check(self) -> Result<(), CatalogError> {
-        validate_catalog(self.entries())
+        validate_catalog(self.entries())?;
+        validate_package_identities(PACKAGE_IDENTITIES)
     }
 
     #[allow(dead_code)] // consumed by the report classifier child after this catalog slice.
@@ -429,7 +488,52 @@ impl ProviderCatalog {
         scope: CatalogScope,
         identity: &ObservedAuthorityIdentity,
     ) -> AuthorityResolution {
+        // LLM contract: cron mapping is NotClaimed; pure and read-only.
+        if cron_mapping_is_not_claimed(role, scope) {
+            return AuthorityResolution::NotClaimed;
+        }
         resolve_entries(self.entries(), role, scope, identity)
+    }
+
+    // LLM contract: exact package+ContractPin resolves; unknown/mismatch is Unresolved; pure/read-only.
+    #[allow(dead_code)]
+    pub(crate) fn resolve_cron_scheduler_semantics(
+        self,
+        provider: Provider,
+        package: &PackageIdentityObservation,
+        contract: &AuthorityIdentityObservation,
+    ) -> AuthorityResolution {
+        let package = match package {
+            PackageIdentityObservation::Known(package) => package,
+            PackageIdentityObservation::Unavailable => {
+                return AuthorityResolution::Unresolved(
+                    AuthorityUnknownReason::IdentityUnavailable,
+                );
+            }
+            PackageIdentityObservation::Malformed => {
+                return AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityMalformed);
+            }
+        };
+        let Some(expected) = PACKAGE_IDENTITIES
+            .iter()
+            .copied()
+            .find(|identity| identity.provider == provider && identity.version == package.version)
+        else {
+            return AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityNotCatalogued);
+        };
+        if !package.matches(expected) {
+            return AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable);
+        }
+        if let AuthorityIdentityObservation::Known(identity) = contract
+            && !package_contract_matches(provider, &package.version, identity)
+        {
+            return AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable);
+        }
+        self.resolve_observation(
+            AuthorityRole::SchedulerSemantics,
+            CatalogScope::Provider(provider),
+            contract,
+        )
     }
 }
 
@@ -466,6 +570,9 @@ impl ProviderCatalog {
         scope: CatalogScope,
         observation: &AuthorityIdentityObservation,
     ) -> AuthorityResolution {
+        if cron_mapping_is_not_claimed(role, scope) {
+            return AuthorityResolution::NotClaimed;
+        }
         match observation {
             AuthorityIdentityObservation::Known(identity) => self.resolve(role, scope, identity),
             AuthorityIdentityObservation::Unavailable => {
@@ -478,6 +585,14 @@ impl ProviderCatalog {
     }
 }
 
+fn cron_mapping_is_not_claimed(role: AuthorityRole, scope: CatalogScope) -> bool {
+    role == AuthorityRole::AutomationMapping
+        && matches!(
+            scope,
+            CatalogScope::Provider(Provider::Cronie | Provider::Anacron | Provider::Fcron)
+        )
+}
+
 fn observed_fingerprint(identity: &ObservedAuthorityIdentity) -> Option<&str> {
     match &identity.0 {
         IdentityKind::Source { fingerprint, .. } | IdentityKind::Contract { fingerprint, .. } => {
@@ -486,6 +601,22 @@ fn observed_fingerprint(identity: &ObservedAuthorityIdentity) -> Option<&str> {
                 .map(|fingerprint| fingerprint.0.as_str())
         }
     }
+}
+
+#[allow(dead_code)]
+fn package_contract_matches(
+    provider: Provider,
+    version: &str,
+    identity: &ObservedAuthorityIdentity,
+) -> bool {
+    let expected = match (provider, version) {
+        (Provider::Cronie | Provider::Anacron, "1.7.2") => {
+            "71894fee3c74f3787e77f21a24fbbe0dffb59e7f"
+        }
+        (Provider::Fcron, "3.4.0") => "8198d4b90690fb0f53cca931b6e9bb6d4b9e6f83",
+        _ => return false,
+    };
+    matches!(&identity.0, IdentityKind::Contract { revision, build, .. } if revision == expected && build.as_deref() == Some(version))
 }
 
 pub const fn embedded_catalog() -> ProviderCatalog {
@@ -633,6 +764,29 @@ fn validate_catalog(entries: &[AuthorityRef]) -> Result<(), CatalogError> {
         }) {
             return Err(CatalogError::DuplicateIdentity);
         }
+    }
+    Ok(())
+}
+
+fn validate_package_identities(identities: &[PackageIdentity]) -> Result<(), CatalogError> {
+    if identities.iter().any(|i| {
+        !matches!(
+            i.provider,
+            Provider::Cronie | Provider::Anacron | Provider::Fcron
+        ) || !valid_identity_text(i.version)
+            || !valid_revision_text(i.nixpkgs_revision.0)
+            || !valid_digest(i.source_digest)
+            || i.patch_digests.is_empty()
+            || i.patch_digests.iter().any(|d| !valid_digest(d))
+    }) {
+        return Err(CatalogError::InvalidIdentity);
+    }
+    if identities.iter().enumerate().any(|(n, i)| {
+        identities[..n]
+            .iter()
+            .any(|other| other.provider == i.provider && other.version == i.version)
+    }) {
+        return Err(CatalogError::DuplicateIdentity);
     }
     Ok(())
 }
@@ -909,11 +1063,11 @@ const SYSTEMD_262_CITATIONS: &[SourceCitation] = &[
 ];
 const CRONIE_CITATIONS: &[SourceCitation] = &[SourceCitation {
     title: "Cronie table contract",
-    url: "https://github.com/cronie-crond/cronie/blob/5f9f16b5663becefdd0dd70df31c0ef5ac36f943/man/crontab.5",
+    url: "https://github.com/cronie-crond/cronie/blob/71894fee3c74f3787e77f21a24fbbe0dffb59e7f/man/crontab.5",
 }];
 const ANACRON_CITATIONS: &[SourceCitation] = &[SourceCitation {
     title: "anacron runtime contract",
-    url: "https://github.com/cronie-crond/cronie/blob/5f9f16b5663becefdd0dd70df31c0ef5ac36f943/man/anacron.8",
+    url: "https://github.com/cronie-crond/cronie/blob/71894fee3c74f3787e77f21a24fbbe0dffb59e7f/man/anacron.8",
 }];
 const FCRON_CITATIONS: &[SourceCitation] = &[
     SourceCitation {
@@ -952,6 +1106,41 @@ const NIXOS_INTEGRITY: &[IntegrityPin] = &[
             revision: FullRevision("6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee"),
         },
         digest: "16689e241f3f394bcdc5b91ba22efe2067c8b925d8de717f859426f240f4af9d",
+    },
+];
+
+const CRONIE_PATCH_DIGESTS: &[&str] =
+    &["394ea90857843c2df670f1372bd52af47bafa70754669681b72c4d39a2641553"];
+const FCRON_PATCH_DIGESTS: &[&str] =
+    &["245d7f3c07386bf586bad9452b2399cfaba6f88a8f33e6cd125d632b164e21a2"];
+const CRONIE_SOURCE_DIGEST: &str =
+    "5abcdda44f6deef5a973c405a05b3e4bf1e01f0b227513667dc1e9ee5b52590c";
+const FCRON_SOURCE_DIGEST: &str =
+    "f4e7fc553cdd70ff4b3b6ac9138b3b7cffab9198b8c266d97af0a87506e0e1b5";
+const CRON_NIXPKGS_REVISION: FullRevision =
+    FullRevision("6cdc7fc76e8bf7fde9fa43a849fcaaa70e230dee");
+
+const PACKAGE_IDENTITIES: &[PackageIdentity] = &[
+    PackageIdentity {
+        provider: Provider::Cronie,
+        version: "1.7.2",
+        nixpkgs_revision: CRON_NIXPKGS_REVISION,
+        source_digest: CRONIE_SOURCE_DIGEST,
+        patch_digests: CRONIE_PATCH_DIGESTS,
+    },
+    PackageIdentity {
+        provider: Provider::Anacron,
+        version: "1.7.2",
+        nixpkgs_revision: CRON_NIXPKGS_REVISION,
+        source_digest: CRONIE_SOURCE_DIGEST,
+        patch_digests: CRONIE_PATCH_DIGESTS,
+    },
+    PackageIdentity {
+        provider: Provider::Fcron,
+        version: "3.4.0",
+        nixpkgs_revision: CRON_NIXPKGS_REVISION,
+        source_digest: FCRON_SOURCE_DIGEST,
+        patch_digests: FCRON_PATCH_DIGESTS,
     },
 ];
 
@@ -1045,7 +1234,7 @@ const CATALOG: [AuthorityRef; 11] = [
         CatalogScope::Provider(Provider::Cronie),
         AuthorityRole::SchedulerSemantics,
         "cronie-crond",
-        "5f9f16b5663becefdd0dd70df31c0ef5ac36f943",
+        "71894fee3c74f3787e77f21a24fbbe0dffb59e7f",
         "crontab.5",
         Some("1.7.2"),
         None,
@@ -1058,7 +1247,7 @@ const CATALOG: [AuthorityRef; 11] = [
         CatalogScope::Provider(Provider::Anacron),
         AuthorityRole::SchedulerSemantics,
         "cronie-crond",
-        "5f9f16b5663becefdd0dd70df31c0ef5ac36f943",
+        "71894fee3c74f3787e77f21a24fbbe0dffb59e7f",
         "anacron.8",
         Some("1.7.2"),
         None,
@@ -1197,6 +1386,14 @@ mod tests {
             ),
             AuthorityResolution::Resolved(_)
         ));
+        assert_eq!(
+            catalog.resolve(
+                AuthorityRole::AutomationMapping,
+                CatalogScope::Provider(Provider::Cronie),
+                &exact
+            ),
+            AuthorityResolution::NotClaimed
+        );
         let missing = ObservedAuthorityIdentity::source(
             "NixOS/nixpkgs",
             "e8d924d50a462f89166e31a27bdcbbade35fd8e6",
@@ -1397,5 +1594,111 @@ mod tests {
             validate_catalog(&[entry]),
             Err(CatalogError::InvalidIdentity)
         ));
+    }
+
+    #[test]
+    fn cron_scheduler_requires_exact_package_and_contract_pins() {
+        let catalog = embedded_catalog();
+        let package = |provider, version, revision, source, patches| {
+            ObservedPackageIdentity::new(provider, version, revision, source, patches).unwrap()
+        };
+        let contract = |publisher, revision, name, build, fingerprint| {
+            AuthorityIdentityObservation::Known(
+                ObservedAuthorityIdentity::contract_with_fingerprint(
+                    publisher,
+                    revision,
+                    name,
+                    build,
+                    None,
+                    Some(fingerprint),
+                )
+                .unwrap(),
+            )
+        };
+        let official_tag = contract(
+            "cronie-crond",
+            "71894fee3c74f3787e77f21a24fbbe0dffb59e7f",
+            "crontab.5",
+            Some("1.7.2"),
+            "cronie-1.7.2-v1",
+        );
+        let assert_reason = |provider, package, contract, reason| {
+            assert_eq!(
+                catalog.resolve_cron_scheduler_semantics(provider, &package, contract),
+                reason
+            );
+        };
+        let observed = package(
+            Provider::Cronie,
+            "1.7.2",
+            CRON_NIXPKGS_REVISION.0,
+            CRONIE_SOURCE_DIGEST,
+            CRONIE_PATCH_DIGESTS,
+        );
+        assert_reason(
+            Provider::Cronie,
+            PackageIdentityObservation::Known(observed.clone()),
+            &official_tag,
+            AuthorityResolution::Resolved(CATALOG[7]),
+        );
+        let mut wrong_revision = observed.clone();
+        wrong_revision.nixpkgs_revision.replace_range(0..1, "7");
+        assert_reason(
+            Provider::Cronie,
+            PackageIdentityObservation::Known(wrong_revision),
+            &official_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable),
+        );
+        let mut wrong_source = observed.clone();
+        wrong_source.source_digest.replace_range(0..1, "6");
+        assert_reason(
+            Provider::Cronie,
+            PackageIdentityObservation::Known(wrong_source),
+            &official_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable),
+        );
+        let mut wrong_patch = observed.clone();
+        wrong_patch.patch_digests[0].replace_range(0..1, "4");
+        assert_reason(
+            Provider::Cronie,
+            PackageIdentityObservation::Known(wrong_patch),
+            &official_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable),
+        );
+        assert_reason(
+            Provider::Cronie,
+            PackageIdentityObservation::Unavailable,
+            &official_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityUnavailable),
+        );
+        let fcron = package(
+            Provider::Fcron,
+            "3.4.0",
+            CRON_NIXPKGS_REVISION.0,
+            FCRON_SOURCE_DIGEST,
+            FCRON_PATCH_DIGESTS,
+        );
+        let mut unknown = fcron.clone();
+        unknown.version = "3.4.1".into();
+        assert_reason(
+            Provider::Fcron,
+            PackageIdentityObservation::Known(unknown),
+            &official_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityNotCatalogued),
+        );
+        let post_tag = contract(
+            "cronie-crond",
+            "5f9f16b5663becefdd0dd70df31c0ef5ac36f943",
+            "crontab.5",
+            Some("1.7.2"),
+            "cronie-1.7.2-v1",
+        );
+        let official = PackageIdentityObservation::Known(observed);
+        assert_reason(
+            Provider::Cronie,
+            official,
+            &post_tag,
+            AuthorityResolution::Unresolved(AuthorityUnknownReason::ExactBasisUnverifiable),
+        );
     }
 }
