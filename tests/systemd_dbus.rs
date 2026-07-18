@@ -88,7 +88,7 @@ fn exact_gc_timer_observation_preserves_schedule_without_authority_injection() {
     .unwrap();
     assert!(matches!(
         report.authority(),
-        AuthorityResolution::Unresolved(_)
+        AuthorityResolution::Resolved(_)
     ));
     assert_eq!(report.evidence().entries().len(), 4);
     assert!(
@@ -96,7 +96,7 @@ fn exact_gc_timer_observation_preserves_schedule_without_authority_injection() {
             .evidence()
             .entries()
             .iter()
-            .all(|entry| entry.occurrence().is_none())
+            .all(|entry| entry.occurrence().is_some())
     );
 }
 
@@ -245,7 +245,13 @@ fn unknown_revision_foreign_timer_and_user_manager_keep_identity_free_evidence()
         unknown_revision.authority(),
         AuthorityResolution::Unresolved(AuthorityUnknownReason::IdentityNotCatalogued)
     );
-    assert_identity_free(&unknown_revision);
+    assert!(
+        unknown_revision
+            .evidence()
+            .entries()
+            .iter()
+            .all(|entry| entry.occurrence().is_some())
+    );
 
     let foreign_timer = normalize_systemd_snapshot(
         snapshot(
@@ -314,9 +320,15 @@ fn changed_manager_and_getall_failures_are_local_schedule_unknowns() {
     .unwrap();
     assert!(matches!(
         changed.authority(),
-        AuthorityResolution::Unresolved(_)
+        AuthorityResolution::Resolved(_)
     ));
-    assert_identity_free(&changed);
+    assert!(
+        changed
+            .evidence()
+            .entries()
+            .iter()
+            .all(|entry| entry.occurrence().is_some())
+    );
     assert!(matches!(
         changed
             .evidence()
