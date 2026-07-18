@@ -9,6 +9,8 @@ use std::ffi::CString;
 use std::io::{self, Read};
 use std::{fmt, path::Path, sync::Arc};
 
+use thiserror::Error;
+
 use crate::catalog::{
     AuthorityIdentityObservation, AuthorityResolution, AuthorityRole, ObservedAuthorityIdentity,
     PackageIdentityObservation, ProviderCatalog,
@@ -38,13 +40,18 @@ pub enum FcronTableKind {
     SystemSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FcronPathError {
+    #[error("fcron spool root must be absolute")]
     NotAbsolute,
+    #[error("fcron spool path contains an unsafe component")]
     UnsafeComponent,
+    #[error("fcron spool root does not exist")]
     MissingRoot,
+    #[error("fcron spool root is not a safe directory")]
     UnsafeRoot,
+    #[error("fcron user identifier is invalid")]
     InvalidUser,
 }
 

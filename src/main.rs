@@ -29,7 +29,7 @@ fn main() {
             eprintln!("error: this release currently supports macOS with nix-darwin");
             std::process::exit(2);
         }
-        let input = match macos_adapter::diagnostic_input() {
+        let input = match normalized_macos_input() {
             Ok(input) => input,
             Err(_) => {
                 eprintln!("error: macOS evidence could not be normalized");
@@ -49,6 +49,10 @@ fn main() {
         argument.expect("the no-argument case returned above")
     );
     std::process::exit(2);
+}
+
+fn normalized_macos_input() -> anyhow::Result<nix_maintenance_status::DiagnosticInput> {
+    macos_adapter::diagnostic_input().map_err(anyhow::Error::new)
 }
 
 fn presence_text(claim: Option<&Claim<ObservationValue>>) -> (&'static str, EvidenceClass) {

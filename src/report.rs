@@ -110,11 +110,14 @@ pub struct LaunchdCalendarInterval {
     weekday: LaunchdField<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ScheduleError {
+    #[error("schedule is empty")]
     Empty,
+    #[error("schedule range is invalid")]
     InvalidRange,
+    #[error("schedule interval is zero")]
     ZeroInterval,
 }
 
