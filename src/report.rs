@@ -482,7 +482,7 @@ impl AnacronSchedule {
         if matches!(period, AnacronPeriod::Days(days) if days == 0 || days > 36_500)
             || delay_minutes > 1_000_000
             || random_delay_minutes.is_some_and(|value| value > 1_000_000)
-            || start_hours_range.is_some_and(|(start, end)| start > 23 || end > 23 || start > end)
+            || start_hours_range.is_some_and(|(start, end)| start > 23 || end > 24 || start > end)
         {
             return Err(ScheduleError::InvalidRange);
         }
