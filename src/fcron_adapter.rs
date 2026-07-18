@@ -909,7 +909,7 @@ fn parse_options(value: &str) -> Result<Vec<FcronOption>, ObservationUnknownReas
                 }
                 FcronOption::RunAsOpaque
             }
-            "runfreq" => {
+            "runfreq" | "r" => {
                 let value = parse_u32(
                     argument.ok_or(ObservationUnknownReason::MalformedSyntax)?,
                     65_535,
@@ -920,7 +920,7 @@ fn parse_options(value: &str) -> Result<Vec<FcronOption>, ObservationUnknownReas
                 FcronOption::RunFrequency(value)
             }
             "runonce" => FcronOption::RunOnce(bool_value(true)?),
-            "serial" => FcronOption::Serial(bool_value(true)?),
+            "serial" | "s" => FcronOption::Serial(bool_value(true)?),
             "serialonce" => FcronOption::SerialOnce(bool_value(true)?),
             "strict" => FcronOption::Strict(bool_value(true)?),
             "timezone" => {
@@ -933,7 +933,7 @@ fn parse_options(value: &str) -> Result<Vec<FcronOption>, ObservationUnknownReas
                     FcronOption::Timezone(FcronTimezone::new(arg.to_owned()))
                 }
             }
-            "until" => {
+            "until" | "u" => {
                 let value =
                     parse_time_value(argument.ok_or(ObservationUnknownReason::MalformedSyntax)?)?;
                 FcronOption::Until(value)
@@ -1281,9 +1281,15 @@ fn parse_field(value: &str, min: u8, max: u8, names: bool) -> Result<FcronTimeFi
             None
         };
         atoms.push(match named {
-            Some(value) => FcronFieldAtom::Name(value),
+            Some(value) if excluded.is_empty() && step == 1 => FcronFieldAtom::Name(value),
             None if start == end && excluded.is_empty() => FcronFieldAtom::Value(start),
             None => FcronFieldAtom::Range {
+                start,
+                end,
+                step,
+                excluded,
+            },
+            Some(_) => FcronFieldAtom::Range {
                 start,
                 end,
                 step,
@@ -1711,6 +1717,31 @@ mod tests {
                     && matches!(fields.fields()[1].atoms(), [FcronFieldAtom::Value(0)])
                     && matches!(fields.fields()[2].atoms(), [FcronFieldAtom::Any])
         ));
+        let aliases = parse_fcron(
+            "!s\n&r(7) 0 5 * * * /bin/true\n@u(5h) 1d /bin/true\n",
+            FcronTableKind::UserSource,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(aliases.entries().iter().any(|entry| {
+            entry
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::Serial(true)))
+        }));
+        assert!(aliases.entries().iter().any(|entry| {
+            entry
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::RunFrequency(7)))
+        }));
+        assert!(aliases.entries().iter().any(|entry| {
+            entry.options().options().iter().any(
+                |option| matches!(option, FcronOption::Until(value) if value.seconds() == 18_000),
+            )
+        }));
         for line in [
             b"@reboot /bin/true\n".as_slice(),
             b"@resume /bin/true\n".as_slice(),
@@ -1738,6 +1769,18 @@ mod tests {
                 Some(1000)
             ),
             FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
+        let named_exclusion =
+            parse_fcron("0 5 * * MON~MON /bin/true\n", FcronTableKind::UserSource)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            named_exclusion.entries()[0].kind(),
+            FcronEntryKind::Calendar(fields)
+                if matches!(
+                    fields.fields()[4].atoms(),
+                    [FcronFieldAtom::Range { start: 1, end: 1, step: 1, excluded }] if excluded == &[1]
+                )
         ));
         let full_range_periodic = b"%hours * 0-23 * * * /bin/true\n";
         assert!(matches!(
