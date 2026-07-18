@@ -288,6 +288,10 @@ fn parse_cronie(
     kind: CronieTableKind,
     allow_root_marker: bool,
 ) -> Result<Option<CronieSchedule>, ObservationUnknownReason> {
+    // LLM contract: environment directives update the state for subsequent
+    // entries only. Each parsed entry snapshots RANDOM_DELAY at its trigger;
+    // later directives never rewrite earlier definitions, and no raw command
+    // or filesystem/runtime state crosses this pure normalization seam.
     let mut entries = Vec::new();
     let mut timezone = None;
     let mut random_delay = None;
@@ -382,12 +386,21 @@ fn parse_cronie(
             fields,
             user,
             CronieCommand::new(percent_count),
+            random_delay,
         ));
     }
     if entries.is_empty() {
         Ok(None)
     } else {
-        CronieSchedule::new(entries, timezone, random_delay)
+        let aggregate_delay = entries.first().and_then(|first| {
+            let value = first.random_delay_minutes();
+            entries
+                .iter()
+                .all(|entry| entry.random_delay_minutes() == value)
+                .then_some(value)
+                .flatten()
+        });
+        CronieSchedule::new(entries, timezone, aggregate_delay)
             .map(Some)
             .map_err(|_| ObservationUnknownReason::MalformedSyntax)
     }
@@ -631,7 +644,7 @@ pub fn evidence_for_table(
         let entry_schedule = CronieSchedule::new(
             vec![entry.clone()],
             schedule.timezone().cloned(),
-            schedule.random_delay_minutes(),
+            entry.random_delay_minutes(),
         )
         .map_err(|_| InputError::InvalidNormalizedValue)?;
         let occurrence = DefinitionOccurrence::new(
@@ -716,6 +729,7 @@ mod tests {
         };
         assert_eq!(schedule.entries().len(), 1);
         assert_eq!(schedule.random_delay_minutes(), Some(7));
+        assert_eq!(schedule.entries()[0].random_delay_minutes(), Some(7));
         assert!(schedule.timezone().is_some());
         assert_eq!(schedule.entries()[0].command().percent_count(), 1);
         assert!(format!("{schedule:?}").contains("<opaque>"));
@@ -734,6 +748,43 @@ mod tests {
             single_step_schedule.entries()[0].fields()[0].atoms(),
             &[CronieFieldAtom::Range(0, 59, 35)]
         );
+        let scoped_delay = b"0 0 * * * root /bin/one\nRANDOM_DELAY=60\n0 1 * * * root /bin/two\n";
+        let scoped_schedule = match normalize_cronie_file(
+            stat(scoped_delay.len()),
+            scoped_delay,
+            stat(scoped_delay.len()),
+            CronieTableKind::System,
+            Some(0),
+        ) {
+            CronieTableResult::Present(value) => value,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            scoped_schedule
+                .entries()
+                .iter()
+                .map(CronieEntry::random_delay_minutes)
+                .collect::<Vec<_>>(),
+            vec![None, Some(60)]
+        );
+        assert_eq!(scoped_schedule.random_delay_minutes(), None);
+        let scoped_rows = evidence_for_table(
+            &CronieTableResult::Present(scoped_schedule.clone()),
+            Subject::System,
+            SourceRootId::new(2),
+            1,
+            0,
+        )
+        .unwrap();
+        let observed_delays = scoped_rows
+            .iter()
+            .filter_map(|row| row.schedule())
+            .map(|schedule| match schedule {
+                Schedule::Cronie(schedule) => schedule.entries()[0].random_delay_minutes(),
+                other => panic!("unexpected schedule: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed_delays, vec![None, Some(60)]);
         let large_step = b"*/100 0 * * * root /bin/true\n";
         let large_step_schedule = match normalize_cronie_file(
             stat(large_step.len()),

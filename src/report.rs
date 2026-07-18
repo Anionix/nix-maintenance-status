@@ -367,17 +367,20 @@ pub struct CronieEntry {
     fields: [CronieTimeField; 5],
     user: CronieUserField,
     command: CronieCommand,
+    random_delay_minutes: Option<u16>,
 }
 impl CronieEntry {
     pub(crate) fn new(
         fields: [CronieTimeField; 5],
         user: CronieUserField,
         command: CronieCommand,
+        random_delay_minutes: Option<u16>,
     ) -> Self {
         Self {
             fields,
             user,
             command,
+            random_delay_minutes,
         }
     }
     pub fn fields(&self) -> &[CronieTimeField; 5] {
@@ -388,6 +391,9 @@ impl CronieEntry {
     }
     pub const fn command(&self) -> CronieCommand {
         self.command
+    }
+    pub const fn random_delay_minutes(&self) -> Option<u16> {
+        self.random_delay_minutes
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -416,8 +422,16 @@ impl CronieSchedule {
     pub fn timezone(&self) -> Option<&CronieTimezone> {
         self.timezone.as_ref()
     }
-    pub const fn random_delay_minutes(&self) -> Option<u16> {
-        self.random_delay_minutes
+    /// Legacy aggregate accessor. It returns a value only when every entry
+    /// has the same delay; use [`CronieEntry::random_delay_minutes`] for the
+    /// authoritative per-entry value.
+    pub fn random_delay_minutes(&self) -> Option<u16> {
+        let first = self.entries.first()?.random_delay_minutes();
+        self.entries
+            .iter()
+            .all(|entry| entry.random_delay_minutes() == first)
+            .then_some(first)
+            .flatten()
     }
     pub const fn dst(&self) -> CronieDstSemantics {
         CronieDstSemantics::CronieWallClock
