@@ -242,16 +242,28 @@ fn allowed_path(path: &Path, kind: CronieTableKind) -> bool {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 return false;
             };
-            !name.is_empty()
-                && !name.starts_with('.')
-                && !name.starts_with('#')
-                && !name.ends_with('~')
-                && ![".rpmsave", ".rpmorig", ".rpmnew"]
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
+            !ignored_cronie_filename(name)
         }
-        CronieTableKind::UserSpool => parent == Some(Path::new("/var/spool/cron")),
+        CronieTableKind::UserSpool => {
+            if parent != Some(Path::new("/var/spool/cron")) {
+                return false;
+            }
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !ignored_cronie_filename(name))
+        }
     }
+}
+
+fn ignored_cronie_filename(name: &str) -> bool {
+    name.is_empty()
+        || name == "CRON_HOSTNAME"
+        || name.starts_with('.')
+        || name.starts_with('#')
+        || name.ends_with('~')
+        || [".rpmsave", ".rpmorig", ".rpmnew"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 #[cfg(unix)]
@@ -344,6 +356,45 @@ fn parse_cronie(
             }
         }
         let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.first().is_some_and(|part| part.starts_with('@')) {
+            let fields = cron_nickname_fields(parts[0])
+                .ok_or(ObservationUnknownReason::UnsupportedSyntax)?;
+            let command_start = match kind {
+                CronieTableKind::System => 2,
+                CronieTableKind::UserSpool => 1,
+            };
+            if parts.len() <= command_start {
+                return Err(ObservationUnknownReason::UnsupportedSyntax);
+            }
+            let user = if kind == CronieTableKind::System {
+                let username = parts[1];
+                if username.is_empty()
+                    || username.len() > 128
+                    || username.chars().any(char::is_control)
+                {
+                    return Err(ObservationUnknownReason::MalformedSyntax);
+                }
+                if suppress_root_logging && username != "root" {
+                    return Err(ObservationUnknownReason::UnsupportedSyntax);
+                }
+                CronieUserField::System
+            } else {
+                CronieUserField::UserSpool
+            };
+            let percent_count = parts[command_start..]
+                .iter()
+                .map(|part| count_unescaped_percent(part))
+                .sum::<usize>();
+            let percent_count = u16::try_from(percent_count)
+                .map_err(|_| ObservationUnknownReason::MalformedSyntax)?;
+            entries.push(CronieEntry::new(
+                fields,
+                user,
+                CronieCommand::new(percent_count),
+                random_delay,
+            ));
+            continue;
+        }
         let field_count = match kind {
             CronieTableKind::System => 6,
             CronieTableKind::UserSpool => 5,
@@ -422,6 +473,21 @@ fn trim_cronie_env_value(value: &str) -> Result<&str, ()> {
         return Err(());
     }
     Ok(value)
+}
+
+fn cron_nickname_fields(value: &str) -> Option<[CronieTimeField; 5]> {
+    let any = || CronieTimeField::new(vec![CronieFieldAtom::Any]).expect("Any is nonempty");
+    let fixed = |value| {
+        CronieTimeField::new(vec![CronieFieldAtom::Value(value)]).expect("Value is nonempty")
+    };
+    Some(match value {
+        "@hourly" => [fixed(0), any(), any(), any(), any()],
+        "@daily" | "@midnight" => [fixed(0), fixed(0), any(), any(), any()],
+        "@weekly" => [fixed(0), fixed(0), any(), any(), fixed(0)],
+        "@monthly" => [fixed(0), fixed(0), fixed(1), any(), any()],
+        "@yearly" | "@annually" => [fixed(0), fixed(0), fixed(1), fixed(1), any()],
+        _ => return None,
+    })
 }
 
 fn parse_field(token: &str, min: u8, max: u8, names: bool) -> Result<CronieTimeField, ()> {
@@ -733,6 +799,45 @@ mod tests {
         assert!(schedule.timezone().is_some());
         assert_eq!(schedule.entries()[0].command().percent_count(), 1);
         assert!(format!("{schedule:?}").contains("<opaque>"));
+        let system_nickname = b"@daily root /bin/true\n";
+        let system_nickname = match normalize_cronie_file(
+            stat(system_nickname.len()),
+            system_nickname,
+            stat(system_nickname.len()),
+            CronieTableKind::System,
+            Some(0),
+        ) {
+            CronieTableResult::Present(value) => value,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            system_nickname.entries()[0].fields()[0].atoms(),
+            [CronieFieldAtom::Value(0)]
+        ));
+        assert!(matches!(
+            system_nickname.entries()[0].fields()[1].atoms(),
+            [CronieFieldAtom::Value(0)]
+        ));
+        let user_nickname = b"@hourly /bin/true\n";
+        let user_nickname = normalize_cronie_file(
+            stat(user_nickname.len()),
+            user_nickname,
+            stat(user_nickname.len()),
+            CronieTableKind::UserSpool,
+            None,
+        );
+        assert!(matches!(user_nickname, CronieTableResult::Present(_)));
+        let reboot = b"@reboot /bin/true\n";
+        assert_eq!(
+            normalize_cronie_file(
+                stat(reboot.len()),
+                reboot,
+                stat(reboot.len()),
+                CronieTableKind::UserSpool,
+                None,
+            ),
+            CronieTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        );
         let single_step = b"0/35 0 1 1 * root /bin/true\n";
         let single_step_schedule = match normalize_cronie_file(
             stat(single_step.len()),
@@ -889,10 +994,11 @@ mod tests {
                 .iter()
                 .all(|row| row.occurrence().is_some())
         );
+        let unsupported_bytes = b"@reboot true\n";
         let unsupported = normalize_cronie_file(
-            stat(12),
-            b"@daily true\n",
-            stat(12),
+            stat(unsupported_bytes.len()),
+            unsupported_bytes,
+            stat(unsupported_bytes.len()),
             CronieTableKind::UserSpool,
             None,
         );
@@ -1044,10 +1150,15 @@ mod tests {
             "job.rpmsave",
             "job.rpmorig",
             "job.rpmnew",
+            "CRON_HOSTNAME",
         ] {
             assert!(!allowed_path(
                 &Path::new("/etc/cron.d").join(ignored),
                 CronieTableKind::System
+            ));
+            assert!(!allowed_path(
+                &Path::new("/var/spool/cron").join(ignored),
+                CronieTableKind::UserSpool
             ));
         }
         for ordinary in ["nix.gc", "job.bak", "job#copy"] {
