@@ -647,43 +647,36 @@ fn occurrence(snapshot: &SystemdBusSnapshot) -> DefinitionOccurrence {
     )
 }
 
-fn systemd_shape(snapshot: &SystemdBusSnapshot, unstable: bool) -> Option<DefinitionShape> {
-    let (schedule, target) = if unstable {
+fn systemd_shape(
+    properties: &SystemdTimerProperties,
+    changed: bool,
+    generation_attested: bool,
+) -> DefinitionShape {
+    let (schedule, target) = if changed {
         (
-            ShapeState::Unknown(ShapeUnknownReason::Incomplete),
-            ShapeState::Unknown(ShapeUnknownReason::Incomplete),
+            ShapeState::Unavailable(UnavailableReason::ChangedDuringRead),
+            ShapeState::Unavailable(UnavailableReason::ChangedDuringRead),
+        )
+    } else if !generation_attested {
+        (
+            ShapeState::Unavailable(UnavailableReason::ConsistencyNotAttested),
+            ShapeState::Unavailable(UnavailableReason::ConsistencyNotAttested),
         )
     } else {
-        match &snapshot.properties {
-            Ok(Some(properties)) => (
-                ShapeState::Known(match properties.schedule() {
-                    Schedule::Systemd(schedule) => schedule,
-                    _ => unreachable!("systemd properties yield systemd schedule"),
-                }),
-                ShapeState::Known(properties.target().clone()),
-            ),
-            Ok(None) => (
-                ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-            ),
-            Err(error) => match error.presence() {
-                Presence::Unavailable(reason) => (
-                    ShapeState::Unavailable(reason),
-                    ShapeState::Unavailable(reason),
-                ),
-                _ => (
-                    ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                    ShapeState::Unknown(ShapeUnknownReason::NotObserved),
-                ),
-            },
-        }
+        (
+            ShapeState::Known(match properties.schedule() {
+                Schedule::Systemd(schedule) => schedule,
+                _ => unreachable!("systemd properties yield systemd schedule"),
+            }),
+            ShapeState::Known(properties.target().clone()),
+        )
     };
-    Some(DefinitionShape::Systemd {
+    DefinitionShape::Systemd {
         schedule,
         target,
         command: ShapeState::Unknown(ShapeUnknownReason::Incomplete),
         context: ShapeState::Known(ExecutionContext::System),
-    })
+    }
 }
 
 // LLM contract: normalization is triggered by one typed, bounded snapshot.
@@ -727,9 +720,13 @@ pub fn normalize_systemd_snapshot(
         )
         && matches!(operation_authority, AuthorityResolution::Resolved(_));
     let occurrence = if structural_identity {
+        let properties = match &snapshot.properties {
+            Ok(Some(properties)) => properties,
+            _ => unreachable!("structural identity requires timer properties"),
+        };
         Some(
             occurrence(&snapshot)
-                .with_shape(systemd_shape(&snapshot, unstable).expect("systemd identity has shape"))
+                .with_shape(systemd_shape(properties, changed, generation_attested))
                 .map_err(SystemdAdapterError::InvalidInput)?,
         )
     } else {
@@ -1217,6 +1214,23 @@ mod tests {
                 && entry.presence()
                     == Presence::Unavailable(UnavailableReason::ConsistencyNotAttested)
         }));
+        assert!(
+            report
+                .evidence()
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.occurrence())
+                .all(|occurrence| matches!(
+                    occurrence.shape(),
+                    Some(DefinitionShape::Systemd {
+                        schedule: ShapeState::Unavailable(
+                            UnavailableReason::ConsistencyNotAttested
+                        ),
+                        target: ShapeState::Unavailable(UnavailableReason::ConsistencyNotAttested),
+                        ..
+                    })
+                ))
+        );
         let input = crate::diagnostic::DiagnosticInput::new(
             crate::evidence::TargetPlatform::Linux,
             crate::evidence::ScanScope::System,
