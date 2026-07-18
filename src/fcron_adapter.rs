@@ -915,7 +915,16 @@ fn parse_periodic_line(
     {
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
-    let options = context.options.merge(&local_options);
+    let inherited = context
+        .options
+        .options()
+        .iter()
+        .filter(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let options = FcronOptionSet::default()
+        .merge(&inherited)
+        .merge(&local_options);
     let full_range = fields
         .iter()
         .zip([(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)])
@@ -2454,17 +2463,33 @@ mod tests {
             ),
             FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
         ));
-        let inherited_run_frequency = b"!runfreq(7)\n%daily * 5 /bin/true\n";
-        assert!(matches!(
-            normalize_fcron_file(
-                stat(inherited_run_frequency.len()),
-                inherited_run_frequency,
-                stat(inherited_run_frequency.len()),
-                FcronTableKind::UserSource,
-                Some(1000)
-            ),
-            FcronTableResult::Present(_)
-        ));
+        let inherited_run_frequency = parse_fcron(
+            "!runfreq(7),s\n%daily * 5 /bin/true\n0 6 * * * /bin/true\n",
+            FcronTableKind::UserSource,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            inherited_run_frequency.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .all(|option| !matches!(option, FcronOption::RunFrequency(_)))
+        );
+        assert!(
+            inherited_run_frequency.entries()[0]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::Serial(true)))
+        );
+        assert!(
+            inherited_run_frequency.entries()[1]
+                .options()
+                .options()
+                .iter()
+                .any(|option| matches!(option, FcronOption::RunFrequency(7)))
+        );
         let named_exclusion =
             parse_fcron("0 5 * * MON~MON /bin/true\n", FcronTableKind::UserSource)
                 .unwrap()
