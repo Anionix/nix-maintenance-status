@@ -1294,12 +1294,15 @@ impl EvidenceLedger {
     }
 }
 
-// LLM contract: generic Evidence is the sole trigger for inventory rows. Only
-// rows with a validated provider occurrence become candidates; identity-free
-// rows remain ledger/Coverage evidence. Rows are grouped by the normalized
-// provider/subject/occurrence key; conflicting Presence values become local
-// Unknown. Sorting is canonical and this function performs no I/O, network,
-// mutation, telemetry, scheduler operation, or GC execution.
+// LLM contract: generic Evidence is the sole trigger for inventory rows. A
+// Cronie/fcron occurrence is selected only when at least one row is Present,
+// then every row for that occurrence is retained for claims and provenance.
+// Identity-free rows and non-Present occurrences with no Present companion
+// remain ledger/Coverage evidence. Providers with structural occurrences
+// (for example systemd) retain their existing candidate semantics until their
+// provider ticket defines the same cardinality boundary. Sorting is canonical
+// and this function performs no I/O, network, mutation, telemetry, scheduler
+// operation, or GC execution.
 pub(crate) fn build_inventory(
     evidence: &ProviderEvidenceSet,
     ledger: &EvidenceLedger,
@@ -1312,11 +1315,33 @@ pub(crate) fn build_inventory(
         ),
         Vec<&ProviderEvidence>,
     > = BTreeMap::new();
-    for entry in evidence
-        .entries()
-        .iter()
-        .filter(|entry| entry.occurrence().is_some())
-    {
+    let selected_occurrences: BTreeSet<(Provider, Subject, crate::evidence::DefinitionOccurrence)> =
+        evidence
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                (matches!(entry.provider(), Provider::Cronie | Provider::Fcron)
+                    && entry.presence() == Presence::Present)
+                    .then(|| {
+                        entry
+                            .occurrence()
+                            .cloned()
+                            .map(|occurrence| (entry.provider(), entry.subject(), occurrence))
+                    })
+                    .flatten()
+            })
+            .collect();
+    for entry in evidence.entries().iter().filter(|entry| {
+        let Some(occurrence) = entry.occurrence() else {
+            return false;
+        };
+        !matches!(entry.provider(), Provider::Cronie | Provider::Fcron)
+            || selected_occurrences.contains(&(
+                entry.provider(),
+                entry.subject(),
+                occurrence.clone(),
+            ))
+    }) {
         groups
             .entry((
                 entry.provider(),
