@@ -511,6 +511,292 @@ impl AnacronSchedule {
     }
 }
 
+/// A fcron duration.  The upstream grammar permits seconds and uses four
+/// weeks for `m`; keeping seconds avoids lossy conversion of elapsed-uptime
+/// schedules while callers still get a bounded, typed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronTimeValue {
+    seconds: u64,
+}
+
+impl FcronTimeValue {
+    pub(crate) const fn from_seconds(seconds: u64) -> Self {
+        Self { seconds }
+    }
+
+    pub const fn seconds(self) -> u64 {
+        self.seconds
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronLoadAverage {
+    tenths: u16,
+}
+
+impl FcronLoadAverage {
+    pub(crate) const fn from_tenths(tenths: u16) -> Self {
+        Self { tenths }
+    }
+
+    pub const fn tenths(self) -> u16 {
+        self.tenths
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FcronFieldAtom {
+    Any,
+    Value(u8),
+    Range {
+        start: u8,
+        end: u8,
+        step: u8,
+        excluded: Vec<u8>,
+    },
+    Name(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronTimeField(Vec<FcronFieldAtom>);
+
+impl FcronTimeField {
+    pub(crate) fn new(atoms: Vec<FcronFieldAtom>) -> Result<Self, ScheduleError> {
+        (!atoms.is_empty())
+            .then_some(Self(atoms))
+            .ok_or(ScheduleError::Empty)
+    }
+
+    pub fn atoms(&self) -> &[FcronFieldAtom] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronCalendarFields {
+    fields: [FcronTimeField; 5],
+}
+
+impl FcronCalendarFields {
+    pub(crate) fn new(fields: [FcronTimeField; 5]) -> Self {
+        Self { fields }
+    }
+
+    pub fn fields(&self) -> &[FcronTimeField; 5] {
+        &self.fields
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FcronPeriodicKeyword {
+    Hourly,
+    Midhourly,
+    Daily,
+    Middaily,
+    Nightly,
+    Weekly,
+    Midweekly,
+    Monthly,
+    Midmonthly,
+    Yearly,
+    Annually,
+    Minutes,
+    Hours,
+    Days,
+    Months,
+    DayOfWeek,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronTimezone(String);
+
+impl fmt::Debug for FcronTimezone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque>")
+    }
+}
+
+impl FcronTimezone {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FcronOption {
+    BootRun(bool),
+    DayAnd(bool),
+    DayOr(bool),
+    ErrorOnlyMail(bool),
+    ExeSev(bool),
+    First(FcronTimeValue),
+    ForceMail(bool),
+    Jitter(u8),
+    Lavg([Option<FcronLoadAverage>; 3]),
+    LavgOne { slot: u8, value: FcronLoadAverage },
+    LavgAnd(bool),
+    LavgOnce(bool),
+    LavgOr(bool),
+    Random(bool),
+    RunAtReboot(bool),
+    RunAtResume(bool),
+    RunAsOpaque,
+    RunFrequency(u32),
+    RunOnce(bool),
+    Serial(bool),
+    SerialOnce(bool),
+    Mail(bool),
+    MailFromOpaque,
+    MailToOpaque,
+    Nice(i8),
+    NoticeNotRun(bool),
+    NoLog(bool),
+    RebootReset(bool),
+    Stdout(bool),
+    Strict(bool),
+    TzDiff(i16),
+    Timezone(FcronTimezone),
+    TimezoneSystem,
+    Until(FcronTimeValue),
+    Volatile(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FcronOptionSet(Vec<FcronOption>);
+
+impl FcronOptionSet {
+    pub(crate) fn merge(&self, options: &[FcronOption]) -> Self {
+        let mut merged = self.0.clone();
+        for option in options {
+            let key = option_key(option);
+            merged.retain(|existing| option_key(existing) != key);
+            merged.push(option.clone());
+        }
+        merged.sort();
+        Self(merged)
+    }
+
+    pub fn options(&self) -> &[FcronOption] {
+        &self.0
+    }
+}
+
+fn option_key(option: &FcronOption) -> u8 {
+    match option {
+        FcronOption::BootRun(_) => 0,
+        FcronOption::DayAnd(_) | FcronOption::DayOr(_) => 1,
+        FcronOption::ErrorOnlyMail(_) => 2,
+        FcronOption::ExeSev(_) => 3,
+        FcronOption::First(_) => 4,
+        FcronOption::ForceMail(_) => 5,
+        FcronOption::Jitter(_) => 6,
+        FcronOption::Lavg(_) => 7,
+        FcronOption::LavgAnd(_) | FcronOption::LavgOr(_) => 8,
+        FcronOption::LavgOnce(_) => 9,
+        FcronOption::Random(_) => 10,
+        FcronOption::RunAtReboot(_) => 11,
+        FcronOption::RunAtResume(_) => 12,
+        FcronOption::RunAsOpaque => 13,
+        FcronOption::RunFrequency(_) => 14,
+        FcronOption::RunOnce(_) => 15,
+        FcronOption::Serial(_) => 16,
+        FcronOption::SerialOnce(_) => 17,
+        FcronOption::Mail(_) => 18,
+        FcronOption::MailFromOpaque => 19,
+        FcronOption::MailToOpaque => 20,
+        FcronOption::Nice(_) => 21,
+        FcronOption::NoticeNotRun(_) => 22,
+        FcronOption::NoLog(_) => 23,
+        FcronOption::RebootReset(_) => 24,
+        FcronOption::Stdout(_) => 25,
+        FcronOption::Strict(_) => 26,
+        FcronOption::TzDiff(_) => 27,
+        FcronOption::Timezone(_) | FcronOption::TimezoneSystem => 28,
+        FcronOption::Until(_) => 29,
+        FcronOption::Volatile(_) => 30,
+        FcronOption::LavgOne { slot, .. } => match slot {
+            1 => 31,
+            5 => 32,
+            15 => 33,
+            _ => 34,
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum FcronEntryKind {
+    Elapsed {
+        frequency: FcronTimeValue,
+    },
+    Calendar(FcronCalendarFields),
+    Periodic {
+        keyword: FcronPeriodicKeyword,
+        fields: Option<FcronCalendarFields>,
+    },
+    Reboot {
+        resume: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronEntry {
+    kind: FcronEntryKind,
+    options: FcronOptionSet,
+}
+
+impl FcronEntry {
+    pub(crate) fn new(kind: FcronEntryKind, options: FcronOptionSet) -> Self {
+        Self { kind, options }
+    }
+
+    pub const fn kind(&self) -> &FcronEntryKind {
+        &self.kind
+    }
+
+    pub const fn options(&self) -> &FcronOptionSet {
+        &self.options
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FcronSchedule {
+    entries: Vec<FcronEntry>,
+    options: FcronOptionSet,
+    timezone: Option<FcronTimezone>,
+}
+
+impl FcronSchedule {
+    pub(crate) fn new(
+        entries: Vec<FcronEntry>,
+        options: FcronOptionSet,
+        timezone: Option<FcronTimezone>,
+    ) -> Result<Self, ScheduleError> {
+        (!entries.is_empty())
+            .then_some(Self {
+                entries,
+                options,
+                timezone,
+            })
+            .ok_or(ScheduleError::Empty)
+    }
+
+    pub fn entries(&self) -> &[FcronEntry] {
+        &self.entries
+    }
+
+    pub const fn options(&self) -> &FcronOptionSet {
+        &self.options
+    }
+
+    pub const fn timezone(&self) -> Option<&FcronTimezone> {
+        self.timezone.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Schedule {
@@ -518,6 +804,7 @@ pub enum Schedule {
     Systemd(SystemdSchedule),
     Cronie(CronieSchedule),
     Anacron(AnacronSchedule),
+    Fcron(FcronSchedule),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
