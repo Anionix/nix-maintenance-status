@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::anacron_adapter::AnacronDate;
 use crate::catalog::{AuthorityResolution, AuthorityRole};
 use crate::report::Schedule;
 
@@ -100,10 +101,12 @@ pub enum UnavailableReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Presence {
     Absent,
     PresentEmpty,
     Present,
+    Unknown(UnavailableReason),
     Unavailable(UnavailableReason),
 }
 
@@ -201,6 +204,12 @@ normalized_identifier!(LaunchdLabel, pub);
 normalized_identifier!(SystemdUnitId, pub);
 normalized_identifier!(AnacronStateNamespace, pub);
 normalized_identifier!(AnacronJobId, pub);
+
+impl AnacronJobId {
+    pub(crate) fn normalized(&self) -> &str {
+        &(self.0).0
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceRootId(u32);
@@ -339,6 +348,7 @@ pub struct ProviderEvidence {
     presence: Presence,
     occurrence: Option<DefinitionOccurrence>,
     schedule: Option<Schedule>,
+    last_attempt: Option<AnacronDate>,
     authorities: [AuthorityResolution; 3],
 }
 
@@ -356,6 +366,7 @@ impl ProviderEvidence {
             presence,
             occurrence: None,
             schedule: None,
+            last_attempt: None,
             authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
@@ -412,6 +423,7 @@ impl ProviderEvidence {
             presence,
             occurrence: Some(occurrence),
             schedule: None,
+            last_attempt: None,
             authorities: [AuthorityResolution::NotClaimed; 3],
         })
     }
@@ -433,6 +445,9 @@ impl ProviderEvidence {
     }
     pub const fn schedule(&self) -> Option<&Schedule> {
         self.schedule.as_ref()
+    }
+    pub const fn last_attempt(&self) -> Option<AnacronDate> {
+        self.last_attempt
     }
     pub const fn authority(&self, role: AuthorityRole) -> AuthorityResolution {
         self.authorities[role.index()]
@@ -482,6 +497,7 @@ impl ProviderEvidence {
             (&self.provider, &schedule),
             (Provider::NixDarwinLaunchd, Schedule::Launchd(_))
                 | (Provider::NixOsSystemd, Schedule::Systemd(_))
+                | (Provider::Anacron, Schedule::Anacron(_))
         );
         if self.component != ObservationComponent::Schedule
             || !provider_matches
@@ -493,6 +509,24 @@ impl ProviderEvidence {
             return Err(InputError::DuplicateEvidenceKey);
         }
         self.schedule = Some(schedule);
+        Ok(self)
+    }
+
+    // LLM contract: only an Anacron LastResult row with Unknown/consistency
+    // presence may attach one normalized date. Other providers/components and repeated
+    // values are rejected; this stores no timestamp path or raw bytes.
+    pub(crate) fn with_last_attempt(mut self, date: AnacronDate) -> Result<Self, InputError> {
+        if self.provider != Provider::Anacron
+            || self.component != ObservationComponent::LastResult
+            || !matches!(
+                self.presence,
+                Presence::Unknown(UnavailableReason::ConsistencyNotAttested)
+            )
+            || self.last_attempt.is_some()
+        {
+            return Err(InputError::InvalidNormalizedValue);
+        }
+        self.last_attempt = Some(date);
         Ok(self)
     }
 }

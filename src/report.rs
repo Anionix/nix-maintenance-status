@@ -303,9 +303,92 @@ impl LaunchdSchedule {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+pub enum AnacronPeriod {
+    Days(u32),
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+    Annually,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum AnacronTimeZone {
+    System,
+    Named(String),
+}
+
+impl AnacronTimeZone {
+    pub fn named(value: &str) -> Result<Self, ScheduleError> {
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self::Named(value.to_owned()))
+    }
+    pub const fn system() -> Self {
+        Self::System
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnacronSchedule {
+    period: AnacronPeriod,
+    delay_minutes: u32,
+    start_hours_range: Option<(u8, u8)>,
+    random_delay_minutes: Option<u32>,
+    timezone: AnacronTimeZone,
+}
+
+impl AnacronSchedule {
+    pub fn new(
+        period: AnacronPeriod,
+        delay_minutes: u32,
+        start_hours_range: Option<(u8, u8)>,
+        random_delay_minutes: Option<u32>,
+        timezone: AnacronTimeZone,
+    ) -> Result<Self, ScheduleError> {
+        if matches!(period, AnacronPeriod::Days(days) if days == 0 || days > 36_500)
+            || delay_minutes > 1_000_000
+            || random_delay_minutes.is_some_and(|value| value > 1_000_000)
+            || start_hours_range.is_some_and(|(start, end)| start > 23 || end > 23 || start > end)
+        {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self {
+            period,
+            delay_minutes,
+            start_hours_range,
+            random_delay_minutes,
+            timezone,
+        })
+    }
+    pub const fn period(&self) -> &AnacronPeriod {
+        &self.period
+    }
+    pub const fn delay_minutes(&self) -> u32 {
+        self.delay_minutes
+    }
+    pub const fn start_hours_range(&self) -> Option<(u8, u8)> {
+        self.start_hours_range
+    }
+    pub const fn random_delay_minutes(&self) -> Option<u32> {
+        self.random_delay_minutes
+    }
+    pub const fn timezone(&self) -> &AnacronTimeZone {
+        &self.timezone
+    }
+    pub const fn catch_up(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Schedule {
     Launchd(LaunchdSchedule),
     Systemd(SystemdSchedule),
+    Anacron(AnacronSchedule),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -395,7 +478,9 @@ impl CoverageMatrix {
                             && entry.component() == component
                     }) {
                         match row.presence() {
-                            Presence::Unavailable(reason) => unavailable = Some(reason),
+                            Presence::Unavailable(reason) | Presence::Unknown(reason) => {
+                                unavailable = Some(reason)
+                            }
                             Presence::Absent | Presence::PresentEmpty | Presence::Present => {
                                 observed = true
                             }
@@ -557,10 +642,15 @@ impl AutomationClaims {
                                 crate::diagnostic::UnknownReason::EvidenceUnavailable(
                                     UnavailableReason::MalformedEvidence,
                                 )
-                            } else if let Presence::Unavailable(reason) = first {
-                                crate::diagnostic::UnknownReason::EvidenceUnavailable(reason)
                             } else {
-                                crate::diagnostic::UnknownReason::DependentClaimUnknown
+                                match first {
+                                    Presence::Unavailable(reason) | Presence::Unknown(reason) => {
+                                        crate::diagnostic::UnknownReason::EvidenceUnavailable(
+                                            reason,
+                                        )
+                                    }
+                                    _ => crate::diagnostic::UnknownReason::DependentClaimUnknown,
+                                }
                             },
                             ids,
                             authorities,
@@ -676,12 +766,12 @@ fn presence_claim(
         Presence::Absent => Some(ObservationValue::Absent),
         Presence::PresentEmpty => Some(ObservationValue::PresentEmpty),
         Presence::Present => Some(ObservationValue::Present),
-        Presence::Unavailable(_) => None,
+        Presence::Unknown(_) | Presence::Unavailable(_) => None,
     };
     match value {
         None => unknown_claim(
             crate::diagnostic::UnknownReason::EvidenceUnavailable(match presence {
-                Presence::Unavailable(reason) => reason,
+                Presence::Unknown(reason) | Presence::Unavailable(reason) => reason,
                 _ => unreachable!(),
             }),
             ids,

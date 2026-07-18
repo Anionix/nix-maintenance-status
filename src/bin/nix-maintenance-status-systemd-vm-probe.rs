@@ -51,7 +51,8 @@ fn main() {
             Presence::Present => "present",
             Presence::PresentEmpty => "present",
             Presence::Absent => "absent",
-            Presence::Unavailable(_) => "unknown",
+            Presence::Unknown(_) | Presence::Unavailable(_) => "unknown",
+            _ => "unknown",
         })
         .unwrap_or("not-applicable");
     let configuration = evidence_presence(report.evidence(), ObservationComponent::Configuration);
@@ -146,7 +147,8 @@ fn evidence_presence(
         .map_or("unknown", |entry| match entry.presence() {
             Presence::Present | Presence::PresentEmpty => "present",
             Presence::Absent => "absent",
-            Presence::Unavailable(_) => "unknown",
+            Presence::Unknown(_) | Presence::Unavailable(_) => "unknown",
+            _ => "unknown",
         })
 }
 
@@ -155,10 +157,11 @@ fn transport_error_reason(error: SystemdTransportError) -> UnavailableReason {
     // LLM contract: failures map to typed UnavailableReason, never raw text or Absent.
     match error {
         SystemdTransportError::Bus(error) => match error.presence() {
-            Presence::Unavailable(reason) => reason,
+            Presence::Unknown(reason) | Presence::Unavailable(reason) => reason,
             Presence::Absent | Presence::PresentEmpty | Presence::Present => {
                 UnavailableReason::InterfaceUnavailable
             }
+            _ => UnavailableReason::InterfaceUnavailable,
         },
         SystemdTransportError::InvalidInput(_) => UnavailableReason::MalformedEvidence,
         _ => UnavailableReason::InterfaceUnavailable,
