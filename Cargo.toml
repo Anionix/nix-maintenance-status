@@ -12,6 +12,10 @@ keywords = ["nix", "nix-darwin", "macos", "observability", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+[dependencies]
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+
 [features]
 systemd-vm-probe = []
 

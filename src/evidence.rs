@@ -116,17 +116,26 @@ pub enum Presence {
     Unavailable(UnavailableReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InputError {
+    #[error("evidence set is empty")]
     EmptyEvidence,
+    #[error("evidence key is duplicated")]
     DuplicateEvidenceKey,
+    #[error("platform and provider are incompatible")]
     InvalidPlatformProvider,
+    #[error("scan scope is invalid")]
     InvalidScope,
+    #[error("scan window is invalid")]
     InvalidScanWindow,
+    #[error("subject is invalid")]
     InvalidSubject,
+    #[error("normalized value is invalid")]
     InvalidNormalizedValue,
+    #[error("definition occurrence is invalid")]
     InvalidDefinitionOccurrence,
+    #[error("evidence is internally inconsistent")]
     InconsistentInput,
 }
 
@@ -1044,6 +1053,15 @@ mod tests {
                 anacron,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn typed_errors_have_safe_stable_messages() {
+        assert_eq!(InputError::InvalidSubject.to_string(), "subject is invalid");
+        assert_eq!(
+            InputError::DuplicateEvidenceKey.to_string(),
+            "evidence key is duplicated"
         );
     }
 }
