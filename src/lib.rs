@@ -1,3 +1,4 @@
+mod anacron_adapter;
 mod catalog;
 mod cronie_adapter;
 mod diagnostic;
@@ -6,6 +7,7 @@ mod report;
 mod systemd_adapter;
 mod systemd_transport;
 
+pub use anacron_adapter::*;
 pub use catalog::*;
 pub use cronie_adapter::*;
 pub use diagnostic::*;

@@ -423,10 +423,101 @@ impl CronieSchedule {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+pub enum AnacronPeriod {
+    Days(u32),
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+    Annually,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum AnacronTimeZone {
+    System,
+    Named(String),
+}
+
+impl fmt::Debug for AnacronTimeZone {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System => formatter.write_str("System"),
+            Self::Named(_) => formatter.write_str("Named(<opaque>)"),
+        }
+    }
+}
+
+impl AnacronTimeZone {
+    pub fn named(value: &str) -> Result<Self, ScheduleError> {
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self::Named(value.to_owned()))
+    }
+    pub const fn system() -> Self {
+        Self::System
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AnacronSchedule {
+    period: AnacronPeriod,
+    delay_minutes: u32,
+    start_hours_range: Option<(u8, u8)>,
+    random_delay_minutes: Option<u32>,
+    timezone: AnacronTimeZone,
+}
+impl AnacronSchedule {
+    pub fn new(
+        period: AnacronPeriod,
+        delay_minutes: u32,
+        start_hours_range: Option<(u8, u8)>,
+        random_delay_minutes: Option<u32>,
+        timezone: AnacronTimeZone,
+    ) -> Result<Self, ScheduleError> {
+        if matches!(period, AnacronPeriod::Days(days) if days == 0 || days > 36_500)
+            || delay_minutes > 1_000_000
+            || random_delay_minutes.is_some_and(|value| value > 1_000_000)
+            || start_hours_range.is_some_and(|(start, end)| start > 23 || end > 23 || start > end)
+        {
+            return Err(ScheduleError::InvalidRange);
+        }
+        Ok(Self {
+            period,
+            delay_minutes,
+            start_hours_range,
+            random_delay_minutes,
+            timezone,
+        })
+    }
+    pub const fn period(&self) -> &AnacronPeriod {
+        &self.period
+    }
+    pub const fn delay_minutes(&self) -> u32 {
+        self.delay_minutes
+    }
+    pub const fn start_hours_range(&self) -> Option<(u8, u8)> {
+        self.start_hours_range
+    }
+    pub const fn random_delay_minutes(&self) -> Option<u32> {
+        self.random_delay_minutes
+    }
+    pub const fn timezone(&self) -> &AnacronTimeZone {
+        &self.timezone
+    }
+    pub const fn catch_up(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Schedule {
     Launchd(LaunchdSchedule),
     Systemd(SystemdSchedule),
     Cronie(CronieSchedule),
+    Anacron(AnacronSchedule),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
