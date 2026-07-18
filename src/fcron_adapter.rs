@@ -906,6 +906,15 @@ fn parse_periodic_line(
         }
     }
     let fields: [FcronTimeField; 5] = fields.try_into().expect("five calendar fields");
+    // fcron resets the per-entry run-frequency while parsing a periodic line.
+    // A run-frequency inherited from the file-wide context is therefore not
+    // the same as a local `r(...)` option and must not invalidate the entry.
+    if local_options
+        .iter()
+        .any(|option| matches!(option, FcronOption::RunFrequency(_)))
+    {
+        return Err(ObservationUnknownReason::UnsupportedSyntax);
+    }
     let options = context.options.merge(&local_options);
     let full_range = fields
         .iter()
@@ -1205,8 +1214,9 @@ fn ensure_context_options(
 ) -> Result<(), ObservationUnknownReason> {
     // LLM contract: a parsed entry is either accepted with options valid for
     // its kind or becomes UnsupportedSyntax; no option is silently dropped.
-    // Calendar entries reject Random, periodic entries reject Jitter and
-    // RunFrequency, while all other options remain local to this pure parser.
+    // Calendar entries reject Random, periodic entries reject Jitter, while
+    // local periodic RunFrequency is rejected at the line parser. Inherited
+    // RunFrequency remains valid because fcron resets it for periodic lines.
     if matches!(kind, FcronEntryKind::Calendar(_))
         && options
             .options()
@@ -1216,12 +1226,10 @@ fn ensure_context_options(
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
     if matches!(kind, FcronEntryKind::Periodic { .. })
-        && options.options().iter().any(|option| {
-            matches!(
-                option,
-                FcronOption::Jitter(_) | FcronOption::RunFrequency(_)
-            )
-        })
+        && options
+            .options()
+            .iter()
+            .any(|option| matches!(option, FcronOption::Jitter(_)))
     {
         return Err(ObservationUnknownReason::UnsupportedSyntax);
     }
@@ -2445,6 +2453,17 @@ mod tests {
                 Some(1000)
             ),
             FcronTableResult::Unknown(ObservationUnknownReason::UnsupportedSyntax)
+        ));
+        let inherited_run_frequency = b"!runfreq(7)\n%daily * 5 /bin/true\n";
+        assert!(matches!(
+            normalize_fcron_file(
+                stat(inherited_run_frequency.len()),
+                inherited_run_frequency,
+                stat(inherited_run_frequency.len()),
+                FcronTableKind::UserSource,
+                Some(1000)
+            ),
+            FcronTableResult::Present(_)
         ));
         let named_exclusion =
             parse_fcron("0 5 * * MON~MON /bin/true\n", FcronTableKind::UserSource)
